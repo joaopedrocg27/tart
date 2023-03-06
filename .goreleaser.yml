@@ -5,6 +5,7 @@ before:
     - .ci/set-version.sh
     - swift build -c debug --product tart
     - gon gon.hcl
+    - codesign --verify --deep --strict --verbose=2 .build/arm64-apple-macosx/debug/tart
 
 builds:
   - builder: prebuilt
