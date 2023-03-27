@@ -3,7 +3,8 @@ project_name: tart
 before:
   hooks:
     - .ci/set-version.sh
-    - swift build -c debug --product tart
+    - swift build -c release --product tart
+    - ./.ci/create-pkg.sh
 
 builds:
   - builder: prebuilt
@@ -12,7 +13,7 @@ builds:
     goarch:
       - arm64
     prebuilt:
-      path: .build/arm64-apple-macosx/debug/tart
+      path: .build/arm64-apple-macosx/release/tart
     hooks:
       post:
         - gon gon.hcl
@@ -29,6 +30,8 @@ archives:
 
 release:
   prerelease: auto
+  extra_files:
+    - glob: ./.ci/Tart-{{ .Tag }}.pkg
 
 brews:
   - name: tart
