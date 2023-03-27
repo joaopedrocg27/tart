@@ -80,6 +80,8 @@ task:
   always:
     dist_artifacts:
       path: "dist/*"
+    pkg_artifacts:
+      path: ".ci/*.pkg"
 
 task:
   name: Release
