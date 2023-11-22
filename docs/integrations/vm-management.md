@@ -11,8 +11,8 @@ Tart can create VMs from `*.ipsw` files. You can download a specific `*.ipsw` fi
 use `latest` instead of a path to `*.ipsw` to download the latest available version:
 
 ```bash
-tart create --from-ipsw=latest monterey-vanilla
-tart run monterey-vanilla
+tart create --from-ipsw=latest sonoma-vanilla
+tart run sonoma-vanilla
 ```
 
 After the initial booting of the VM you'll need to manually go through the macOS installation process. As a convention we recommend creating an `admin` user with an `admin` password. After the regular installation please do some additional modifications in the VM:
@@ -54,7 +54,7 @@ Please refer to `tart set --help` for additional details.
 ## Building with Packer
 
 Please refer to [Tart Packer Plugin repository](https://github.com/cirruslabs/packer-plugin-tart) for setup instructions.
-Here is an example of a template to build `monterey-base` local image based of a remote image:
+Here is an example of a template to build a local image based of a remote image:
 
 ```hcl
 packer {
@@ -67,8 +67,8 @@ packer {
 }
 
 source "tart-cli" "tart" {
-  vm_base_name = "ghcr.io/cirruslabs/macos-ventura-base:latest"
-  vm_name      = "my-custom-ventura"
+  vm_base_name = "ghcr.io/cirruslabs/macos-sonoma-base:latest"
+  vm_name      = "my-custom-sonoma"
   cpu_count    = 4
   memory_gb    = 8
   disk_size_gb = 70
@@ -92,7 +92,9 @@ Here is a [repository with Packer templates](https://github.com/cirruslabs/macos
 
 ## Working with a Remote OCI Container Registry
 
+<!-- markdownlint-disable MD034 -->
 For example, let's say you want to push/pull images to a registry hosted at https://acme.io/.
+<!-- markdownlint-enable MD034 -->
 
 ### Registry Authorization
 

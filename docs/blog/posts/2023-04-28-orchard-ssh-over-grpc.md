@@ -56,7 +56,7 @@ On bootstrap, each Orchard worker establishes a `Watch()` RPC stream and waits f
 
 Once `PortForward` instruction is received, the worker connects to the specified VM and port locally and opens a new `PortForward()` RPC stream with the controller, carrying the unique `session` identifier in the gRPC metadata to help distinguish several port forwarding requests.
 
-We’re using a pretty ingenious Golang package that turns any gRPC stream into a `net.Conn`: https://github.com/mitchellh/go-grpc-net-conn. This allows us to abstract from the gRPC details and simply proxy two `net.Conns`, thus providing the port forwarding functionality.
+We’re using a pretty ingenious [Golang package that turns any gRPC stream into a `net.Conn`](https://github.com/mitchellh/go-grpc-net-conn). This allows us to abstract from the gRPC details and simply proxy two `net.Conns`, thus providing the port forwarding functionality.
 
 We’ve also initially considered using [Yamux](https://github.com/hashicorp/yamux) to only keep a single connection with each worker, however, that involves the burden of dealing with flow control and potential implementation bugs associated with it, so we’ve decided to simply open an additional connection for each port forwarding session and let the OS deal with it.
 
@@ -74,25 +74,25 @@ Secondly, we’ve exposed three commands in the Orchard CLI that all use this en
 
 Opens a TCP port locally and forwards everything sent to it to the specified VM (and vice versa).
 
-For example, `orchard port-forward vm ventura-builder 2222:22` will forward traffic from the local TCP port `2222` to the `ventura-builder` VM’s TCP port `22`.
+For example, `orchard port-forward vm sonoma-builder 2222:22` will forward traffic from the local TCP port `2222` to the `ventura-builder` VM’s TCP port `22`.
 
 ### `orchard ssh`
 
 Connects to the specified VM on the default SSH port `22`, optionally only launching a command (if specified), similarly to what the official OpenSSH client does.
 
-For example, `orchard ssh vm ventura-builder` will open an interactive session with the `ventura-builder` VM.
+For example, `orchard ssh vm sonoma-builder` will open an interactive session with the `ventura-builder` VM.
 
 You can also send local scripts for execution by utilizing redirection:
 
 ```shell
-orchard ssh vm ventura-builder 'sh -s' < script.sh
+orchard ssh vm sonoma-builder 'sh -s' < script.sh
 ```
 
 ### `orchard vnc`
 
 Establishes a port forwarding to the specified VM’s default VNC port `5900` and opens the default macOS Screen Sharing app.
 
-For example, `orchard vnc vm ventura-builder` will establish a port-forwarding to the `ventura-builder` VM's port `5900` under the hood and launch macOS Screen Sharing app.
+For example, `orchard vnc vm sonoma-builder` will establish a port-forwarding to the `ventura-builder` VM's port `5900` under the hood and launch macOS Screen Sharing app.
 
 Note that the SSH and VNC commands expect the VM resource to specify credentials in it’s definition (can be done via `orchard create vm`),  and will otherwise fall back to the credentials specified by `--username` and `--password`, or if none specified — to de-facto standard of `admin:admin` credentials.
 

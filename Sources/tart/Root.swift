@@ -16,6 +16,7 @@ struct Root: AsyncParsableCommand {
       Get.self,
       List.self,
       Login.self,
+      Logout.self,
       IP.self,
       Pull.self,
       Push.self,
@@ -57,6 +58,11 @@ struct Root: AsyncParsableCommand {
       }
     }
 
+    // Add commands that are only available on specific macOS versions
+    if #available(macOS 14, *) {
+      configuration.subcommands.append(Suspend.self)
+    }
+
     // Ensure the default SIGINT handled is disabled,
     // otherwise there's a race between two handlers
     signal(SIGINT, SIG_IGN);
@@ -76,10 +82,12 @@ struct Root: AsyncParsableCommand {
       var command = try parseAsRoot()
 
       // Run garbage-collection before each command (shouldn't take too long)
-      do {
-        try Config().gc()
-      } catch {
-        fputs("Failed to perform garbage collection!\n\(error)\n", stderr)
+      if type(of: command) != type(of: Pull()) && type(of: command) != type(of: Clone()){
+        do {
+          try Config().gc()
+        } catch {
+          fputs("Failed to perform garbage collection!\n\(error)\n", stderr)
+        }
       }
 
       if var asyncCommand = command as? AsyncParsableCommand {

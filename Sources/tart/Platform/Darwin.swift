@@ -6,7 +6,7 @@ struct UnsupportedHostOSError: Error, CustomStringConvertible {
   }
 }
 
-struct Darwin: Platform {
+struct Darwin: PlatformSuspendable {
   var ecid: VZMacMachineIdentifier
   var hardwareModel: VZMacHardwareModel
 
@@ -60,7 +60,7 @@ struct Darwin: Platform {
     let result = VZMacPlatformConfiguration()
 
     result.machineIdentifier = ecid
-    result.auxiliaryStorage = VZMacAuxiliaryStorage(contentsOf: nvramURL)
+    result.auxiliaryStorage = VZMacAuxiliaryStorage(url: nvramURL)
 
     if !hardwareModel.isSupported {
       // At the moment support of M1 chip is not yet dropped in any macOS version
@@ -98,13 +98,35 @@ struct Darwin: Platform {
     return result
   }
 
-  func pointingDevices() -> [VZPointingDeviceConfiguration] {
-    if #available(macOS 13, *) {
-      // Trackpad is only supported starting with macOS Ventura
-      // macOS Monterey will continue using a USB device == .darwin 
-      return [VZMacTrackpadConfiguration(), VZUSBScreenCoordinatePointingDeviceConfiguration()]
+  func keyboards() -> [VZKeyboardConfiguration] {
+    if #available(macOS 14, *) {
+      // Mac keyboard is only supported by guests starting with macOS Ventura
+      return [VZMacKeyboardConfiguration(), VZUSBKeyboardConfiguration()]
     } else {
-      return [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+      return [VZUSBKeyboardConfiguration()]
+    }
+  }
+
+  func keyboardsSuspendable() -> [VZKeyboardConfiguration] {
+    if #available(macOS 14, *) {
+      return [VZMacKeyboardConfiguration()]
+    } else {
+      // fallback to the regular configuration
+      return keyboards()
+    }
+  }
+
+  func pointingDevices() -> [VZPointingDeviceConfiguration] {
+    // Trackpad is only supported by guests starting with macOS Ventura
+    [VZMacTrackpadConfiguration(), VZUSBScreenCoordinatePointingDeviceConfiguration()]
+  }
+
+  func pointingDevicesSuspendable() -> [VZPointingDeviceConfiguration] {
+    if #available(macOS 14, *) {
+      return [VZMacTrackpadConfiguration()]
+    } else {
+      // fallback to the regular configuration
+      return pointingDevices()
     }
   }
 }

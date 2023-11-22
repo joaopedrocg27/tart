@@ -11,7 +11,7 @@ class DockerConfigCredentialsProvider: CredentialsProvider {
     if let credentialsFromAuth = config.auths?[host]?.decodeCredentials() {
       return credentialsFromAuth
     }
-    if let helperProgram = config.credHelpers?[host] {
+    if let helperProgram = try config.findCredHelper(host: host) {
       return try executeHelper(binaryName: "docker-credential-\(helperProgram)", host: host)
     }
 
@@ -41,13 +41,18 @@ class DockerConfigCredentialsProvider: CredentialsProvider {
 
     process.waitUntilExit()
 
+    let outputData = try outPipe.fileHandleForReading.readToEnd()
     if !(process.terminationReason == .exit && process.terminationStatus == 0) {
+      if let outputData = outputData {
+        print(String(decoding: outputData, as: UTF8.self))
+      }
       throw CredentialsProviderError.Failed(message: "Docker helper failed!")
     }
+    if outputData == nil || outputData?.count == 0 {
+      throw CredentialsProviderError.Failed(message: "Docker helper output is empty!")
+    }
 
-    let getOutput = try JSONDecoder().decode(
-      DockerGetOutput.self, from: outPipe.fileHandleForReading.readDataToEndOfFile()
-    )
+    let getOutput = try JSONDecoder().decode(DockerGetOutput.self, from: outputData!)
     return (getOutput.Username, getOutput.Secret)
   }
 
@@ -59,6 +64,26 @@ class DockerConfigCredentialsProvider: CredentialsProvider {
 struct DockerConfig: Codable {
   var auths: Dictionary<String, DockerAuthConfig>? = Dictionary()
   var credHelpers: Dictionary<String, String>? = Dictionary()
+
+  func findCredHelper(host: String) throws -> String? {
+    // Tart supports wildcards in credHelpers
+    // Similar to what is requested from Docker: https://github.com/docker/cli/issues/2928
+
+    guard let credHelpers else {
+      return nil
+    }
+
+    for (hostPattern, helperProgram) in credHelpers {
+      if (hostPattern == host) {
+        return helperProgram
+      }
+      let compiledPattern = try? Regex(hostPattern)
+      if (try compiledPattern?.wholeMatch(in: host) != nil) {
+        return helperProgram
+      }
+    }
+    return nil
+  }
 }
 
 struct DockerAuthConfig: Codable {

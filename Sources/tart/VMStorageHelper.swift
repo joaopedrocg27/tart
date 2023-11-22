@@ -34,9 +34,15 @@ class VMStorageHelper {
   }
 }
 
+extension NSError {
+  func isFileNotFound() -> Bool {
+    return self.code == NSFileNoSuchFileError || self.code == NSFileReadNoSuchFileError
+  }
+}
+
 extension Error {
   func isFileNotFound() -> Bool {
-    (self as NSError).code == NSFileReadNoSuchFileError
+    (self as NSError).isFileNotFound() || (self as NSError).underlyingErrors.contains(where: { $0.isFileNotFound() })
   }
 }
 
@@ -58,6 +64,8 @@ enum RuntimeError : Error {
   case ImportFailed(_ message: String)
   case SoftnetFailed(_ message: String)
   case OCIStorageError(_ message: String)
+  case OCIUnsupportedDiskFormat(_ format: String)
+  case SuspendFailed(_ message: String)
 }
 
 protocol HasExitCode {
@@ -101,6 +109,10 @@ extension RuntimeError : CustomStringConvertible {
       return "Softnet failed: \(message)"
     case .OCIStorageError(let message):
       return "OCI storage error: \(message)"
+    case .OCIUnsupportedDiskFormat(let format):
+      return "OCI disk format \(format) is not supported by this version of Tart"
+    case .SuspendFailed(let message):
+      return "Failed to suspend the VM: \(message)"
     }
   }
 }
@@ -108,6 +120,8 @@ extension RuntimeError : CustomStringConvertible {
 extension RuntimeError : HasExitCode {
   var exitCode: Int32 {
     switch self {
+    case .VMDoesNotExist:
+      return 2
     case .VMNotRunning:
       return 2
     case .VMAlreadyRunning:

@@ -45,7 +45,8 @@ struct TokenResponse: Decodable, Authentication {
   let defaultIssuedAt = Date()
   let defaultExpiresIn = 60
 
-  var token: String
+  var token: String?
+  var accessToken: String?
   var expiresIn: Int?
   var issuedAt: Date?
 
@@ -65,7 +66,13 @@ struct TokenResponse: Decodable, Authentication {
       return dateFormatter.date(from: dateString) ?? Date()
     }
 
-    return try decoder.decode(TokenResponse.self, from: fromData)
+    let response = try decoder.decode(TokenResponse.self, from: fromData)
+
+    guard response.token != nil || response.accessToken != nil else {
+      throw DecodingError.keyNotFound(CodingKeys.token, .init(codingPath: [], debugDescription: "Missing token or access_token. One must be present."))
+    }
+
+    return response
   }
 
   var tokenExpiresAt: Date {
@@ -83,7 +90,7 @@ struct TokenResponse: Decodable, Authentication {
   }
 
   func header() -> (String, String) {
-    ("Authorization", "Bearer \(token)")
+    return ("Authorization", "Bearer \(token ?? accessToken ?? "")")
   }
 
   func isValid() -> Bool {
@@ -92,11 +99,20 @@ struct TokenResponse: Decodable, Authentication {
 }
 
 class Registry {
-  let baseURL: URL
+  private let baseURL: URL
   let namespace: String
   let credentialsProviders: [CredentialsProvider]
+  let authenticationKeeper = AuthenticationKeeper()
 
-  var currentAuthToken: Authentication? = nil
+  var host: String? {
+    guard let host = baseURL.host else { return nil }
+
+    if let port = baseURL.port {
+      return "\(host):\(port)"
+    }
+
+    return host
+  }
 
   init(urlComponents: URLComponents,
        namespace: String,
@@ -225,7 +241,7 @@ class Registry {
     return digest
   }
 
-  public func pullBlob(_ digest: String, handler: (Data) throws -> Void) async throws {
+  public func pullBlob(_ digest: String, handler: (Data) async throws -> Void) async throws {
     let (channel, response) = try await channelRequest(.GET, endpointURL("\(namespace)/blobs/\(digest)"), viaFile: true)
     if response.statusCode != HTTPCode.Ok.rawValue {
       let body = try await channel.asData().asText()
@@ -236,7 +252,7 @@ class Registry {
     for try await part in channel {
       try Task.checkCancellation()
 
-      try handler(Data(part))
+      try await handler(part)
     }
   }
 
@@ -288,11 +304,6 @@ class Registry {
       request.httpBody = body
     }
 
-    // Invalidate token if it has expired
-    if currentAuthToken?.isValid() == false {
-      currentAuthToken = nil
-    }
-
     var (channel, response) = try await authAwareRequest(request: request, viaFile: viaFile)
 
     if doAuth && response.statusCode == HTTPCode.Unauthorized.rawValue {
@@ -314,7 +325,7 @@ class Registry {
 
     if wwwAuthenticate.scheme.lowercased() == "basic" {
       if let (user, password) = try lookupCredentials() {
-        currentAuthToken = BasicAuthentication(user: user, password: password)
+        await authenticationKeeper.set(BasicAuthentication(user: user, password: password))
       }
 
       return
@@ -361,7 +372,7 @@ class Registry {
         + "while retrieving an authentication token", details: data.asText())
     }
 
-    currentAuthToken = try TokenResponse.parse(fromData: data)
+    await authenticationKeeper.set(try TokenResponse.parse(fromData: data))
   }
 
   private func lookupCredentials() throws -> (String, String)? {
@@ -382,8 +393,7 @@ class Registry {
   private func authAwareRequest(request: URLRequest, viaFile: Bool = false) async throws -> (AsyncThrowingChannel<Data, Error>, HTTPURLResponse) {
     var request = request
 
-    if let token = currentAuthToken {
-      let (name, value) = token.header()
+    if let (name, value) = await authenticationKeeper.header() {
       request.addValue(value, forHTTPHeaderField: name)
     }
 

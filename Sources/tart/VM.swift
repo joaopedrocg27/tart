@@ -26,6 +26,9 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
   // Virtualization.Framework's virtual machine
   @Published var virtualMachine: VZVirtualMachine
 
+  // Virtualization.Framework's virtual machine configuration
+  var configuration: VZVirtualMachineConfiguration
+
   // Semaphore used to communicate with the VZVirtualMachineDelegate
   var sema = DispatchSemaphore(value: 0)
 
@@ -39,9 +42,10 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
 
   init(vmDir: VMDirectory,
        network: Network = NetworkShared(),
-       additionalDiskAttachments: [VZDiskImageStorageDeviceAttachment] = [],
+       additionalStorageDevices: [VZStorageDeviceConfiguration] = [],
        directorySharingDevices: [VZDirectorySharingDeviceConfiguration] = [],
-       serialPorts: [VZSerialPortConfiguration] = []
+       serialPorts: [VZSerialPortConfiguration] = [],
+       suspendable: Bool = false
   ) throws {
     name = vmDir.name
     config = try VMConfig.init(fromURL: vmDir.configURL)
@@ -52,11 +56,12 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
 
     // Initialize the virtual machine and its configuration
     self.network = network
-    let configuration = try Self.craftConfiguration(diskURL: vmDir.diskURL,
-                                                    nvramURL: vmDir.nvramURL, vmConfig: config,
-                                                    network: network, additionalDiskAttachments: additionalDiskAttachments,
-                                                    directorySharingDevices: directorySharingDevices,
-                                                    serialPorts: serialPorts
+    configuration = try Self.craftConfiguration(diskURL: vmDir.diskURL,
+                                                nvramURL: vmDir.nvramURL, vmConfig: config,
+                                                network: network, additionalStorageDevices: additionalStorageDevices,
+                                                directorySharingDevices: directorySharingDevices,
+                                                serialPorts: serialPorts,
+                                                suspendable: suspendable
     )
     virtualMachine = VZVirtualMachine(configuration: configuration)
 
@@ -66,9 +71,11 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
 
   static func retrieveIPSW(remoteURL: URL) async throws -> URL {
     // Check if we already have this IPSW in cache
-    let (channel, response) = try await Fetcher.fetch(URLRequest(url: remoteURL), viaFile: true)
+    var headRequest = URLRequest(url: remoteURL)
+    headRequest.httpMethod = "HEAD"
+    let (_, headResponse) = try await Fetcher.fetch(headRequest, viaFile: false)
 
-    if let hash = response.value(forHTTPHeaderField: "x-amz-meta-digest-sha256") {
+    if let hash = headResponse.value(forHTTPHeaderField: "x-amz-meta-digest-sha256") {
       let ipswLocation = try IPSWCache().locationFor(fileName: "sha256:\(hash).ipsw")
 
       if FileManager.default.fileExists(atPath: ipswLocation.path) {
@@ -81,6 +88,8 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
 
     // Download the IPSW
     defaultLogger.appendNewLine("Fetching \(remoteURL.lastPathComponent)...")
+
+    let (channel, response) = try await Fetcher.fetch(URLRequest(url: remoteURL), viaFile: true)
 
     let progress = Progress(totalUnitCount: response.expectedContentLength)
     ProgressObserver(progress).log(defaultLogger)
@@ -133,7 +142,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     ipswURL: URL,
     diskSizeGB: UInt16,
     network: Network = NetworkShared(),
-    additionalDiskAttachments: [VZDiskImageStorageDeviceAttachment] = [],
+    additionalStorageDevices: [VZStorageDeviceConfiguration] = [],
     directorySharingDevices: [VZDirectorySharingDeviceConfiguration] = [],
     serialPorts: [VZSerialPortConfiguration] = []
   ) async throws {
@@ -179,11 +188,11 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
 
     // Initialize the virtual machine and its configuration
     self.network = network
-    let configuration = try Self.craftConfiguration(diskURL: vmDir.diskURL, nvramURL: vmDir.nvramURL,
-                                                    vmConfig: config, network: network,
-                                                    additionalDiskAttachments: additionalDiskAttachments,
-                                                    directorySharingDevices: directorySharingDevices,
-                                                    serialPorts: serialPorts
+    configuration = try Self.craftConfiguration(diskURL: vmDir.diskURL, nvramURL: vmDir.nvramURL,
+                                                vmConfig: config, network: network,
+                                                additionalStorageDevices: additionalStorageDevices,
+                                                directorySharingDevices: directorySharingDevices,
+                                                serialPorts: serialPorts
     )
     virtualMachine = VZVirtualMachine(configuration: configuration)
 
@@ -220,27 +229,18 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     return try VM(vmDir: vmDir)
   }
 
-  func run(_ recovery: Bool) async throws {
+  func start(recovery: Bool, resume shouldResume: Bool) async throws {
     try network.run(sema)
 
-    let startTask = DispatchQueue.main.sync {
-      Task {
-        if #available(macOS 13, *) {
-          // new API introduced in Ventura
-          let startOptions = VZMacOSVirtualMachineStartOptions()
-          startOptions.startUpFromMacOSRecovery = recovery
-          try await virtualMachine.start(options: startOptions)
-        } else {
-          // use method that also available on Monterey
-          try await virtualMachine.start(recovery)
-        }
-      }
+    if shouldResume {
+      try await resume()
+    } else {
+      try await start(recovery)
     }
+  }
 
-    try await withTaskCancellationHandler(operation: {
-      // Await on VZVirtualMachine.start() result
-      _ = try await startTask.value
-
+  func run() async throws {
+    await withTaskCancellationHandler(operation: {
       // Wait for the VM to finish running
       // or for the exit condition
       sema.wait()
@@ -249,14 +249,27 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     })
 
     if Task.isCancelled {
-      DispatchQueue.main.sync {
-        Task {
-          try await self.virtualMachine.stop()
-        }
-      }
+      try await stop()
     }
 
     try await network.stop()
+  }
+
+  @MainActor
+  private func start(_ recovery: Bool) async throws {
+    let startOptions = VZMacOSVirtualMachineStartOptions()
+    startOptions.startUpFromMacOSRecovery = recovery
+    try await virtualMachine.start(options: startOptions)
+  }
+
+  @MainActor
+  private func resume() async throws {
+    try await virtualMachine.resume()
+  }
+
+  @MainActor
+  private func stop() async throws {
+    try await self.virtualMachine.stop()
   }
 
   static func craftConfiguration(
@@ -264,9 +277,10 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     nvramURL: URL,
     vmConfig: VMConfig,
     network: Network = NetworkShared(),
-    additionalDiskAttachments: [VZDiskImageStorageDeviceAttachment],
+    additionalStorageDevices: [VZStorageDeviceConfiguration],
     directorySharingDevices: [VZDirectorySharingDeviceConfiguration],
-    serialPorts: [VZSerialPortConfiguration]
+    serialPorts: [VZSerialPortConfiguration],
+    suspendable: Bool = false
   ) throws -> VZVirtualMachineConfiguration {
     let configuration = VZVirtualMachineConfiguration()
 
@@ -284,37 +298,64 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     configuration.graphicsDevices = [vmConfig.platform.graphicsDevice(vmConfig: vmConfig)]
 
     // Audio
-    let soundDeviceConfiguration = VZVirtioSoundDeviceConfiguration()
-    let inputAudioStreamConfiguration = VZVirtioSoundDeviceInputStreamConfiguration()
-    inputAudioStreamConfiguration.source = VZHostAudioInputStreamSource()
-    let outputAudioStreamConfiguration = VZVirtioSoundDeviceOutputStreamConfiguration()
-    outputAudioStreamConfiguration.sink = VZHostAudioOutputStreamSink()
-    soundDeviceConfiguration.streams = [inputAudioStreamConfiguration, outputAudioStreamConfiguration]
-    configuration.audioDevices = [soundDeviceConfiguration]
+    if !suspendable {
+      let soundDeviceConfiguration = VZVirtioSoundDeviceConfiguration()
+      let inputAudioStreamConfiguration = VZVirtioSoundDeviceInputStreamConfiguration()
+      inputAudioStreamConfiguration.source = VZHostAudioInputStreamSource()
+      let outputAudioStreamConfiguration = VZVirtioSoundDeviceOutputStreamConfiguration()
+      outputAudioStreamConfiguration.sink = VZHostAudioOutputStreamSink()
+      soundDeviceConfiguration.streams = [inputAudioStreamConfiguration, outputAudioStreamConfiguration]
+      configuration.audioDevices = [soundDeviceConfiguration]
+    }
 
     // Keyboard and mouse
-    configuration.keyboards = [VZUSBKeyboardConfiguration()]
-    configuration.pointingDevices = vmConfig.platform.pointingDevices()
+    if suspendable, let platformSuspendable = vmConfig.platform.self as? PlatformSuspendable {
+      configuration.keyboards = platformSuspendable.keyboardsSuspendable()
+      configuration.pointingDevices = platformSuspendable.pointingDevicesSuspendable()
+    } else {
+      configuration.keyboards = vmConfig.platform.keyboards()
+      configuration.pointingDevices = vmConfig.platform.pointingDevices()
+    }
 
     // Networking
-    let vio = VZVirtioNetworkDeviceConfiguration()
-    vio.attachment = network.attachment()
-    vio.macAddress = vmConfig.macAddress
-    configuration.networkDevices = [vio]
+    configuration.networkDevices = network.attachments().map {
+      let vio = VZVirtioNetworkDeviceConfiguration()
+      vio.attachment = $0
+      vio.macAddress = vmConfig.macAddress
+      return vio
+    }
 
     // Storage
-    var attachments = [try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false)]
-    attachments.append(contentsOf: additionalDiskAttachments)
-    configuration.storageDevices = attachments.map { VZVirtioBlockDeviceConfiguration(attachment: $0) }
+    var devices: [VZStorageDeviceConfiguration] = [
+      VZVirtioBlockDeviceConfiguration(attachment: try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false))
+    ]
+    devices.append(contentsOf: additionalStorageDevices)
+    configuration.storageDevices = devices
 
     // Entropy
-    configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+    if !suspendable {
+      configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+    }
 
     // Directory sharing devices
     configuration.directorySharingDevices = directorySharingDevices
 
     // Serial Port
     configuration.serialPorts = serialPorts
+
+    // Version console device
+    //
+    // A dummy console device useful for implementing
+    // host feature checks in the guest agent software.
+    if !suspendable {
+      let consolePort = VZVirtioConsolePortConfiguration()
+      consolePort.name = "tart-version-\(CI.version)"
+
+      let consoleDevice = VZVirtioConsoleDeviceConfiguration()
+      consoleDevice.ports[0] = consolePort
+
+      configuration.consoleDevices.append(consoleDevice)
+    }
 
     try configuration.validate()
 

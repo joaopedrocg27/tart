@@ -1,5 +1,6 @@
 import ArgumentParser
 import Cocoa
+import Darwin
 import Dispatch
 import SwiftUI
 import Virtualization
@@ -51,10 +52,17 @@ struct Run: AsyncParsableCommand {
   var vncExperimental: Bool = false
 
   @Option(help: ArgumentHelp("""
-  Additional disk attachments with an optional read-only specifier\n(e.g. --disk=\"disk.bin\" --disk=\"ubuntu.iso:ro\")
+  Additional disk attachments with an optional read-only specifier\n(e.g. --disk=\"disk.bin\" --disk=\"ubuntu.iso:ro\" --disk=\"/dev/disk0\")
   """, discussion: """
+  Can be either a disk image file or a block device like a local SSD on AWS EC2 Mac instances.
+
   Learn how to create a disk image using Disk Utility here:
   https://support.apple.com/en-gb/guide/disk-utility/dskutl11888/mac
+
+  To work with block devices 'tart' binary must be executed as root which affects locating Tart VMs.
+  To workaround this issue pass TART_HOME explicitly:
+
+  sudo TART_HOME="$HOME/.tart" tart run sonoma --disk=/dev/disk0
   """, valueName: "path[:ro]"))
   var disk: [String] = []
 
@@ -73,13 +81,17 @@ struct Run: AsyncParsableCommand {
   var rosettaTag: String?
 
   @Option(help: ArgumentHelp("""
-  Additional directory shares with an optional read-only specifier\n(e.g. --dir=\"build:~/src/build\" --dir=\"sources:~/src/sources:ro\")
+  Additional directory shares with an optional read-only specifier\n(e.g. --dir=\"~/src/build\" or --dir=\"~/src/sources:ro\")
   """, discussion: """
   Requires host to be macOS 13.0 (Ventura) or newer.
-  All shared directories are automatically mounted to "/Volumes/My Shared Files" directory on macOS,
+  A shared directory is automatically mounted to "/Volumes/My Shared Files" directory on macOS,
   while on Linux you have to do it manually: "mount -t virtiofs com.apple.virtio-fs.automount /mount/point".
   For macOS guests, they must be running macOS 13.0 (Ventura) or newer.
-  """, valueName: "name:path[:ro]"))
+
+  In case of passing multiple directories it is required to prefix them with names e.g. --dir=\"build:~/src/build\" --dir=\"sources:~/src/sources:ro\"
+  These names will be used as directory names under the mounting point inside guests. For the example above it will be
+  "/Volumes/My Shared Files/build" and "/Volumes/My Shared Files/sources" respectively.
+  """, valueName: "[name:]path[:ro]"))
   var dir: [String] = []
 
   @Option(help: ArgumentHelp("""
@@ -87,48 +99,74 @@ struct Run: AsyncParsableCommand {
   """, discussion: """
   Specify "list" as an interface name (--net-bridged=list) to list the available bridged interfaces.
   """, valueName: "interface name"))
-  var netBridged: String?
+  var netBridged: [String] = []
 
   @Flag(help: ArgumentHelp("Use software networking instead of the default shared (NAT) networking",
                            discussion: "Learn how to configure Softnet for use with Tart here: https://github.com/cirruslabs/softnet"))
   var netSoftnet: Bool = false
 
-  func validate() throws {
+  @Flag(help: ArgumentHelp("Disables audio and entropy devices and switches to only Mac-specific input devices.", discussion: "Useful for running a VM that can be suspended via \"tart suspend\"."))
+  var suspendable: Bool = false
+
+  @Flag(help: ArgumentHelp("Whether system hot keys should be sent to the guest instead of the host",
+                           discussion: "If enabled then system hot keys like Cmd+Tab will be sent to the guest instead of the host."))
+  var captureSystemKeys: Bool = false
+
+  mutating func validate() throws {
     if vnc && vncExperimental {
       throw ValidationError("--vnc and --vnc-experimental are mutually exclusive")
     }
-    if netBridged != nil && netSoftnet {
+
+    if netBridged.count > 0 && netSoftnet {
       throw ValidationError("--net-bridged and --net-softnet are mutually exclusive")
     }
 
     if graphics && noGraphics {
       throw ValidationError("--graphics and --no-graphics are mutually exclusive")
     }
+
+    if (noGraphics || vnc || vncExperimental) && captureSystemKeys {
+      throw ValidationError("--captures-system-keys can only be used with the default VM view")
+    }
+
+    let localStorage = VMStorageLocal()
+    let vmDir = try localStorage.open(name)
+    if try vmDir.state() == "suspended" {
+      suspendable = true
+    }
+
+    if suspendable {
+      if dir.count > 0 {
+        throw ValidationError("Suspending VMs with shared directories is not supported")
+      }
+    }
   }
 
   @MainActor
   func run() async throws {
-    let vmDir = try VMStorageLocal().open(name)
+    let localStorage = VMStorageLocal()
+    let vmDir = try localStorage.open(name)
+
+    let storageLock = try FileLock(lockURL: Config().tartHomeDir)
+    if try vmDir.state() == "suspended" {
+      try storageLock.lock() // lock before checking
+      let needToGenerateNewMac = try localStorage.list().contains {
+        // check if there is a running VM with the same MAC but different name
+        try $1.running() && $1.macAddress() == vmDir.macAddress() && $1.name != vmDir.name
+      }
+
+      if needToGenerateNewMac {
+        print("There is already a running VM with the same MAC address!")
+        print("Resetting VM to assign a new MAC address...")
+        try vmDir.regenerateMACAddress()
+      }
+    }
 
     if netSoftnet && isInteractiveSession() {
       try Softnet.configureSUIDBitIfNeeded()
     }
 
     let additionalDiskAttachments = try additionalDiskAttachments()
-
-    // Error out if the disk is locked by the host (e.g. it was mounted in Finder),
-    // see https://github.com/cirruslabs/tart/issues/323 for more details.
-    for additionalDiskAttachment in additionalDiskAttachments {
-      // Read-only attachments do not seem to acquire the lock
-      if additionalDiskAttachment.isReadOnly {
-        continue
-      }
-
-      if try !FileLock(lockURL: additionalDiskAttachment.url).trylock() {
-        throw RuntimeError.DiskAlreadyInUse("disk \(additionalDiskAttachment.url.path) seems to be already in use, "
-          + "unmount it first in Finder")
-      }
-    }
 
     var serialPorts: [VZSerialPortConfiguration] = []
     if serial {
@@ -151,9 +189,10 @@ struct Run: AsyncParsableCommand {
     vm = try VM(
       vmDir: vmDir,
       network: userSpecifiedNetwork(vmDir: vmDir) ?? NetworkShared(),
-      additionalDiskAttachments: additionalDiskAttachments,
+      additionalStorageDevices: additionalDiskAttachments,
       directorySharingDevices: directoryShares() + rosettaDirectoryShare(),
-      serialPorts: serialPorts
+      serialPorts: serialPorts,
+      suspendable: suspendable
     )
 
     let vncImpl: VNC? = try {
@@ -184,8 +223,25 @@ struct Run: AsyncParsableCommand {
       throw RuntimeError.VMAlreadyRunning("VM \"\(name)\" is already running!")
     }
 
+    // now VM state will return "running" so we can unlock
+    try storageLock.unlock()
+
     let task = Task {
       do {
+        var resume = false
+
+        if #available(macOS 14, *) {
+          if FileManager.default.fileExists(atPath: vmDir.stateURL.path) {
+            print("restoring VM state from a snapshot...")
+            try await vm!.virtualMachine.restoreMachineStateFrom(url: vmDir.stateURL)
+            try FileManager.default.removeItem(at: vmDir.stateURL)
+            resume = true
+            print("resuming VM...")
+          }
+        }
+
+        try await vm!.start(recovery: recovery, resume: resume)
+
         if let vncImpl = vncImpl {
           let vncURL = try await vncImpl.waitForURL()
 
@@ -197,7 +253,7 @@ struct Run: AsyncParsableCommand {
           }
         }
 
-        try await vm!.run(recovery)
+        try await vm!.run()
 
         if let vncImpl = vncImpl {
           try vncImpl.stop()
@@ -215,17 +271,54 @@ struct Run: AsyncParsableCommand {
       }
     }
 
+    // "tart stop" support
     let sigintSrc = DispatchSource.makeSignalSource(signal: SIGINT)
     sigintSrc.setEventHandler {
       task.cancel()
     }
     sigintSrc.activate()
 
+    // "tart suspend" / UI window closing support
+    signal(SIGUSR1, SIG_IGN)
+    let sigusr1Src = DispatchSource.makeSignalSource(signal: SIGUSR1)
+    sigusr1Src.setEventHandler {
+      Task {
+        do {
+          if #available(macOS 14, *) {
+            try vm!.configuration.validateSaveRestoreSupport()
+
+            print("pausing VM to take a snapshot...")
+            try await vm!.virtualMachine.pause()
+
+            print("creating a snapshot...")
+            try await vm!.virtualMachine.saveMachineStateTo(url: vmDir.stateURL)
+
+            print("snapshot created successfully! shutting down the VM...")
+
+            task.cancel()
+          } else {
+            print(RuntimeError.SuspendFailed("this functionality is only supported on macOS 14 (Sonoma) or newer"))
+
+            Foundation.exit(1)
+          }
+        } catch (let e) {
+          print(RuntimeError.SuspendFailed(e.localizedDescription))
+
+          Foundation.exit(1)
+        }
+      }
+    }
+    sigusr1Src.activate()
+
     let useVNCWithoutGraphics = (vnc || vncExperimental) && !graphics
     if noGraphics || useVNCWithoutGraphics {
-      dispatchMain()
+      // enter the main even loop, without bringing up any UI,
+      // and just wait for the VM to exit.
+      let nsApp = NSApplication.shared
+      nsApp.setActivationPolicy(.prohibited)
+      nsApp.run()
     } else {
-      runUI()
+      runUI(suspendable, captureSystemKeys)
     }
   }
 
@@ -250,23 +343,19 @@ struct Run: AsyncParsableCommand {
       return try Softnet(vmMACAddress: config.macAddress.string)
     }
 
-    if let netBridged = netBridged {
-      let matchingInterfaces = VZBridgedNetworkInterface.networkInterfaces.filter { interface in
-        interface.identifier == netBridged || interface.localizedDisplayName == netBridged
+    if netBridged.count > 0 {
+      func findBridgedInterface(_ name: String) throws -> VZBridgedNetworkInterface {
+        let interface = VZBridgedNetworkInterface.networkInterfaces.first { interface in
+          interface.identifier == name || interface.localizedDisplayName == name
+        }
+        if (interface == nil) {
+          throw ValidationError("no bridge interfaces matched \"\(netBridged)\", "
+            + "available interfaces: \(bridgeInterfaces())")
+        }
+        return interface!
       }
 
-      if matchingInterfaces.isEmpty {
-        let available = bridgeInterfaces().joined(separator: ", ")
-        throw ValidationError("no bridge interfaces matched \"\(netBridged)\", "
-          + "available interfaces: \(available)")
-      }
-
-      if matchingInterfaces.count > 1 {
-        throw ValidationError("more than one bridge interface matched \"\(netBridged)\", "
-          + "consider refining the search criteria")
-      }
-
-      return NetworkBridged(interface: matchingInterfaces.first!)
+      return NetworkBridged(interfaces: try netBridged.map { try findBridgedInterface($0) })
     }
 
     return nil
@@ -284,22 +373,43 @@ struct Run: AsyncParsableCommand {
     }
   }
 
-  func additionalDiskAttachments() throws -> [VZDiskImageStorageDeviceAttachment] {
-    var result: [VZDiskImageStorageDeviceAttachment] = []
+  func additionalDiskAttachments() throws -> [VZStorageDeviceConfiguration] {
+    var result: [VZStorageDeviceConfiguration] = []
     let readOnlySuffix = ":ro"
     let expandedDiskPaths = disk.map { NSString(string:$0).expandingTildeInPath }
 
     for rawDisk in expandedDiskPaths {
-      if rawDisk.hasSuffix(readOnlySuffix) {
-        result.append(try VZDiskImageStorageDeviceAttachment(
-          url: URL(fileURLWithPath: String(rawDisk.prefix(rawDisk.count - readOnlySuffix.count))),
-          readOnly: true
-        ))
+      let diskReadOnly = rawDisk.hasSuffix(readOnlySuffix)
+      let diskPath = diskReadOnly ? String(rawDisk.prefix(rawDisk.count - readOnlySuffix.count)) : rawDisk
+      let diskURL = URL(fileURLWithPath: diskPath)
+
+      // check if `diskPath` is a block device or a directory
+      if pathHasMode(diskPath, mode: S_IFBLK) || pathHasMode(diskPath, mode: S_IFDIR) {
+        print("Using block device\n")
+        guard #available(macOS 14, *) else {
+          throw UnsupportedOSError("attaching block devices", "are")
+        }
+        let fileHandle = FileHandle(forUpdatingAtPath: diskPath)
+        guard fileHandle != nil else {
+          if ProcessInfo.processInfo.userName != "root" {
+            throw RuntimeError.VMConfigurationError("need to run as root to work with block devices")
+          }
+          throw RuntimeError.VMConfigurationError("block device \(diskURL.url.path) seems to be already in use, unmount it first via 'diskutil unmount'")
+        }
+        let attachment = try VZDiskBlockDeviceStorageDeviceAttachment(fileHandle: fileHandle!, readOnly: diskReadOnly, synchronizationMode: .full)
+        result.append(VZVirtioBlockDeviceConfiguration(attachment: attachment))
       } else {
-        result.append(try VZDiskImageStorageDeviceAttachment(
-          url: URL(fileURLWithPath: rawDisk),
-          readOnly: false
-        ))
+        // Error out if the disk is locked by the host (e.g. it was mounted in Finder),
+        // see https://github.com/cirruslabs/tart/issues/323 for more details.
+        if try !diskReadOnly && !FileLock(lockURL: diskURL).trylock() {
+          throw RuntimeError.DiskAlreadyInUse("disk \(diskURL.url.path) seems to be already in use, unmount it first in Finder")
+        }
+
+        let diskImageAttachment = try VZDiskImageStorageDeviceAttachment(
+          url: diskURL,
+          readOnly: diskReadOnly
+        )
+        result.append(VZVirtioBlockDeviceConfiguration(attachment: diskImageAttachment))
       }
     }
 
@@ -315,46 +425,31 @@ struct Run: AsyncParsableCommand {
       throw UnsupportedOSError("directory sharing", "is")
     }
 
-    struct DirectoryShare {
-      let name: String
-      let path: URL
-      let readOnly: Bool
-    }
-
     var directoryShares: [DirectoryShare] = []
 
+    var allNamedShares = true
     for rawDir in dir {
-      let splits = rawDir.split(maxSplits: 2) { $0 == ":" }
-
-      if splits.count < 2 {
-        throw ValidationError("invalid --dir syntax: should at least include name and path, colon-separated")
+      let directoryShare = try DirectoryShare(parseFrom: rawDir)
+      if (directoryShare.name == nil) {
+        allNamedShares = false
       }
-
-      var readOnly: Bool = false
-
-      if splits.count == 3 {
-        if splits[2] == "ro" {
-          readOnly = true
-        } else {
-          throw ValidationError("invalid --dir syntax: optional read-only specifier can only be \"ro\"")
-        }
-      }
-
-      let (name, path) = (String(splits[0]), String(splits[1]))
-
-      directoryShares.append(DirectoryShare(
-        name: name,
-        path: URL(fileURLWithPath: NSString(string: path).expandingTildeInPath),
-        readOnly: readOnly)
-      )
+      directoryShares.append(directoryShare)
     }
 
-    var directories: [String : VZSharedDirectory] = Dictionary()
-    directoryShares.forEach { directories[$0.name] = VZSharedDirectory(url: $0.path, readOnly: $0.readOnly) }
 
     let automountTag = VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag
     let sharingDevice = VZVirtioFileSystemDeviceConfiguration(tag: automountTag)
-    sharingDevice.share = VZMultipleDirectoryShare(directories: directories)
+    if allNamedShares {
+      var directories: [String : VZSharedDirectory] = Dictionary()
+      try directoryShares.forEach { directories[$0.name!] = try $0.createConfiguration() }
+      sharingDevice.share = VZMultipleDirectoryShare(directories: directories)
+    } else if dir.count > 1 {
+      throw ValidationError("invalid --dir syntax: for multiple directory shares each one of them should be named")
+    } else if dir.count == 1 {
+      let directoryShare = directoryShares.first!
+      let singleDirectoryShare = VZSingleDirectoryShare(directory: try directoryShare.createConfiguration())
+      sharingDevice.share = singleDirectoryShare
+    }
 
     return [sharingDevice]
   }
@@ -384,7 +479,7 @@ struct Run: AsyncParsableCommand {
     return [device]
   }
 
-  private func runUI() {
+  private func runUI(_ suspendable: Bool, _ captureSystemKeys: Bool) {
     let nsApp = NSApplication.shared
     nsApp.setActivationPolicy(.regular)
     nsApp.activate(ignoringOtherApps: true)
@@ -392,15 +487,18 @@ struct Run: AsyncParsableCommand {
     nsApp.applicationIconImage = NSImage(data: AppIconData)
 
     struct MainApp: App {
+      static var disappearSignal: Int32 = SIGINT
+      static var capturesSystemKeys: Bool = false
+
       @NSApplicationDelegateAdaptor private var appDelegate: MinimalMenuAppDelegate
 
       var body: some Scene {
         WindowGroup(vm!.name) {
           Group {
-            VMView(vm: vm!).onAppear {
+            VMView(vm: vm!, capturesSystemKeys: MainApp.capturesSystemKeys).onAppear {
               NSWindow.allowsAutomaticWindowTabbing = false
             }.onDisappear {
-              let ret = kill(getpid(), SIGINT)
+              let ret = kill(getpid(), MainApp.disappearSignal)
               if ret != 0 {
                 // Fallback to the old termination method that doesn't
                 // propagate the cancellation to Task's in case graceful
@@ -408,7 +506,14 @@ struct Run: AsyncParsableCommand {
                 NSApplication.shared.terminate(self)
               }
             }
-          }.frame(width: CGFloat(vm!.config.display.width), height: CGFloat(vm!.config.display.height))
+          }.frame(
+            minWidth: CGFloat(vm!.config.display.width),
+            idealWidth: CGFloat(vm!.config.display.width),
+            maxWidth: .infinity,
+            minHeight: CGFloat(vm!.config.display.height),
+            idealHeight: CGFloat(vm!.config.display.height),
+            maxHeight: .infinity
+          )
         }.commands {
           // Remove some standard menu options
           CommandGroup(replacing: .help, addition: {})
@@ -427,13 +532,20 @@ struct Run: AsyncParsableCommand {
               Task { try await vm!.virtualMachine.stop() }
             }
             Button("Request Stop") {
-              Task { try await vm!.virtualMachine.requestStop() }
+              Task { try vm!.virtualMachine.requestStop() }
+            }
+            if #available(macOS 14, *) {
+              Button("Suspend") {
+                kill(getpid(), SIGUSR1)
+              }
             }
           }
         }
       }
     }
 
+    MainApp.disappearSignal = suspendable ? SIGUSR1 : SIGINT
+    MainApp.capturesSystemKeys = captureSystemKeys
     MainApp.main()
   }
 }
@@ -483,15 +595,136 @@ struct VMView: NSViewRepresentable {
   typealias NSViewType = VZVirtualMachineView
 
   @ObservedObject var vm: VM
+  var capturesSystemKeys: Bool
 
   func makeNSView(context: Context) -> NSViewType {
     let machineView = VZVirtualMachineView()
-    // so keys like take a windows screenshot (cmd+shift+4+space) works on the host and not guest
-    machineView.capturesSystemKeys = false
+
+    machineView.capturesSystemKeys = capturesSystemKeys
+
+    // Enable automatic display reconfiguration
+    // for guests that support it
+    if #available(macOS 14.0, *) {
+      machineView.automaticallyReconfiguresDisplay = true
+    }
+
     return machineView
   }
 
   func updateNSView(_ nsView: NSViewType, context: Context) {
     nsView.virtualMachine = vm.virtualMachine
   }
+}
+
+struct DirectoryShare {
+  let name: String?
+  let path: URL
+  let readOnly: Bool
+
+  init(parseFrom: String) throws {
+    let readOnlySuffix = ":ro"
+    readOnly = parseFrom.hasSuffix(readOnlySuffix)
+    let maybeNameAndURL = readOnly ? String(parseFrom.dropLast(readOnlySuffix.count)) : parseFrom
+
+    if maybeNameAndURL.starts(with: "https://") || maybeNameAndURL.starts(with: "http://") {
+      // just a URL
+      name = nil
+      path = URL(string: maybeNameAndURL)!
+      return
+    }
+
+    let splits = maybeNameAndURL.split(separator: ":", maxSplits: 1)
+
+    if splits.count == 2 {
+      name = String(splits[0])
+      path = String(splits[1]).toRemoteOrLocalURL()
+    } else {
+      name = nil
+      path = String(splits[0]).toRemoteOrLocalURL()
+    }
+  }
+
+  func createConfiguration() throws -> VZSharedDirectory {
+    if (path.isFileURL) {
+      return VZSharedDirectory(url: path, readOnly: readOnly)
+    }
+
+    let urlCache = URLCache(memoryCapacity: 0, diskCapacity: 1 * 1024 * 1024 * 1024)
+
+    let archiveRequest = URLRequest(url: path, cachePolicy: .returnCacheDataElseLoad)
+    var response: CachedURLResponse? = urlCache.cachedResponse(for: archiveRequest)
+    if (response == nil) {
+      print("Downloading \(path)...")
+      // download and unarchive remote directories if needed here
+      // use old school API to prevent deadlocks since we are running via MainActor
+      let downloadSemaphore = DispatchSemaphore(value: 0)
+      Task {
+        do {
+          let (archiveData, archiveResponse) = try await URLSession.shared.data(for: archiveRequest)
+          urlCache.storeCachedResponse(CachedURLResponse(response: archiveResponse, data: archiveData, storagePolicy: .allowed), for: archiveRequest)
+          print("Cached for future invocations!")
+        } catch {
+          print("Download failed: \(error)")
+        }
+        downloadSemaphore.signal()
+      }
+      downloadSemaphore.wait()
+      response = urlCache.cachedResponse(for: archiveRequest)
+    } else {
+      print("Using cached archive for \(path)...")
+    }
+
+    if (response == nil) {
+      throw ValidationError("Failed to fetch a remote archive!")
+    }
+
+    let temporaryLocation = try Config().tartTmpDir.appendingPathComponent(UUID().uuidString + ".volume")
+    try FileManager.default.createDirectory(atPath: temporaryLocation.path, withIntermediateDirectories: true)
+    let lock = try FileLock(lockURL: temporaryLocation)
+    try lock.lock()
+
+    guard let executableURL = resolveBinaryPath("tar") else {
+      throw ValidationError("tar not found in PATH")
+    }
+
+    let process = Process.init()
+    process.executableURL = executableURL
+    process.currentDirectoryURL = temporaryLocation
+    process.arguments = ["-xz"]
+
+    let inPipe = Pipe()
+    process.standardInput = inPipe
+    process.launch()
+
+    inPipe.fileHandleForWriting.write(response!.data)
+    try inPipe.fileHandleForWriting.close()
+    process.waitUntilExit()
+
+    if !(process.terminationReason == .exit && process.terminationStatus == 0) {
+      throw ValidationError("Unarchiving failed!")
+    }
+
+    print("Unarchived into a temporary directory!")
+
+    return VZSharedDirectory(url: temporaryLocation, readOnly: readOnly)
+  }
+}
+
+extension String {
+  func toRemoteOrLocalURL() -> URL {
+    if (starts(with: "https://") || starts(with: "https://")) {
+      URL(string: self)!
+    } else {
+      URL(fileURLWithPath: NSString(string: self).expandingTildeInPath)
+    }
+  }
+}
+
+func pathHasMode(_ path: String, mode: mode_t) -> Bool {
+  var st = stat()
+  let statRes = stat(path, &st)
+  guard statRes != -1 else {
+    return false
+  }
+  return (Int32(st.st_mode) & Int32(mode)) == Int32(mode)
 }
