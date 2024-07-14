@@ -1,7 +1,8 @@
-import Foundation
-import Virtualization
 import Atomics
+import Foundation
+import Semaphore
 import System
+import Virtualization
 
 enum SoftnetError: Error {
   case InitializationFailed(why: String)
@@ -15,7 +16,7 @@ class Softnet: Network {
 
   let vmFD: Int32
 
-  init(vmMACAddress: String) throws {
+  init(vmMACAddress: String, extraArguments: [String] = []) throws {
     let fds = UnsafeMutablePointer<Int32>.allocate(capacity: MemoryLayout<Int>.stride * 2)
 
     let ret = socketpair(AF_UNIX, SOCK_DGRAM, 0, fds)
@@ -30,7 +31,7 @@ class Softnet: Network {
     try setSocketBuffers(softnetFD, 1 * 1024 * 1024);
 
     process.executableURL = try Self.softnetExecutableURL()
-    process.arguments = ["--vm-fd", String(STDIN_FILENO), "--vm-mac-address", vmMACAddress]
+    process.arguments = ["--vm-fd", String(STDIN_FILENO), "--vm-mac-address", vmMACAddress] + extraArguments
     process.standardInput = FileHandle(fileDescriptor: softnetFD, closeOnDealloc: false)
   }
 
@@ -44,7 +45,7 @@ class Softnet: Network {
     return executableURL
   }
 
-  func run(_ sema: DispatchSemaphore) throws {
+  func run(_ sema: AsyncSemaphore) throws {
     try process.run()
 
     monitorTask = Task {

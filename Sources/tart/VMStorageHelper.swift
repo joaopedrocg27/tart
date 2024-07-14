@@ -50,10 +50,13 @@ enum RuntimeError : Error {
   case VMConfigurationError(_ message: String)
   case VMDoesNotExist(name: String)
   case VMMissingFiles(_ message: String)
-  case VMNotRunning(_ message: String)
+  case VMIsRunning(_ name: String)
+  case VMNotRunning(_ name: String)
   case VMAlreadyRunning(_ message: String)
   case NoIPAddressFound(_ message: String)
   case DiskAlreadyInUse(_ message: String)
+  case FailedToOpenBlockDevice(_ path: String, _ explanation: String)
+  case InvalidDiskSize(_ message: String)
   case FailedToUpdateAccessDate(_ message: String)
   case PIDLockFailed(_ message: String)
   case FailedToParseRemoteName(_ message: String)
@@ -66,6 +69,7 @@ enum RuntimeError : Error {
   case OCIStorageError(_ message: String)
   case OCIUnsupportedDiskFormat(_ format: String)
   case SuspendFailed(_ message: String)
+  case PullFailed(_ message: String)
 }
 
 protocol HasExitCode {
@@ -81,13 +85,19 @@ extension RuntimeError : CustomStringConvertible {
       return "the specified VM \"\(name)\" does not exist"
     case .VMMissingFiles(let message):
       return message
-    case .VMNotRunning(let message):
-      return message
+    case .VMIsRunning(let name):
+      return "VM \"\(name)\" is running"
+    case .VMNotRunning(let name):
+      return "VM \"\(name)\" is not running"
     case .VMAlreadyRunning(let message):
       return message
     case .NoIPAddressFound(let message):
       return message
     case .DiskAlreadyInUse(let message):
+      return message
+    case .FailedToOpenBlockDevice(let path, let explanation):
+      return "failed to open block device \(path): \(explanation)"
+    case .InvalidDiskSize(let message):
       return message
     case .FailedToUpdateAccessDate(let message):
       return message
@@ -113,6 +123,8 @@ extension RuntimeError : CustomStringConvertible {
       return "OCI disk format \(format) is not supported by this version of Tart"
     case .SuspendFailed(let message):
       return "Failed to suspend the VM: \(message)"
+    case .PullFailed(let message):
+      return message
     }
   }
 }

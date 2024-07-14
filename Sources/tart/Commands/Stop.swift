@@ -6,7 +6,7 @@ import SwiftDate
 struct Stop: AsyncParsableCommand {
   static var configuration = CommandConfiguration(commandName: "stop", abstract: "Stop a VM")
 
-  @Argument(help: "VM name")
+  @Argument(help: "VM name", completion: .custom(completeRunningMachines))
   var name: String
 
   @Option(name: [.short, .long], help: "Seconds to wait for graceful termination before forcefully terminating the VM")
@@ -15,12 +15,12 @@ struct Stop: AsyncParsableCommand {
   func run() async throws {
     let vmDir = try VMStorageLocal().open(name)
     switch try vmDir.state() {
-    case "suspended":
+    case .Suspended:
       try stopSuspended(vmDir)
-    case "running":
+    case .Running:
       try await stopRunning(vmDir)
-    default:
-      return
+    case .Stopped:
+      throw RuntimeError.VMNotRunning(name)
     }
   }
 
@@ -29,12 +29,12 @@ struct Stop: AsyncParsableCommand {
   }
 
   func stopRunning(_ vmDir: VMDirectory) async throws {
-    let lock = try PIDLock(lockURL: vmDir.configURL)
+    let lock = try vmDir.lock()
 
     // Find the VM's PID
     var pid = try lock.pid()
     if pid == 0 {
-      throw RuntimeError.VMNotRunning("VM \"\(name)\" is not running")
+      throw RuntimeError.VMNotRunning(name)
     }
 
     // Try to gracefully terminate the VM

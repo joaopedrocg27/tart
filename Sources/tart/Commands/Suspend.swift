@@ -6,15 +6,15 @@ import SwiftDate
 struct Suspend: AsyncParsableCommand {
   static var configuration = CommandConfiguration(commandName: "suspend", abstract: "Suspend a VM")
 
-  @Argument(help: "VM name")
+  @Argument(help: "VM name", completion: .custom(completeRunningMachines))
   var name: String
 
   func run() async throws {
     let vmDir = try VMStorageLocal().open(name)
-    let lock = try PIDLock(lockURL: vmDir.configURL)
+    let lock = try vmDir.lock()
 
     // Find the VM's PID
-    var pid = try lock.pid()
+    let pid = try lock.pid()
     if pid == 0 {
       throw RuntimeError.VMNotRunning("VM \"\(name)\" is not running")
     }

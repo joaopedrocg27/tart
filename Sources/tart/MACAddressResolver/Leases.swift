@@ -37,13 +37,18 @@ class Leases {
   }
 
   init(_ fromString: String) throws {
-    var leases: [MACAddress : Lease] = Dictionary()
+    let leases = try Self.retrieveRawLeases(fromString).compactMap({ rawLease in
+      Lease(fromRawLease: rawLease)
+    }).filter({ lease in
+      lease.expiresAt.isInFuture
+    }).map({ lease in
+      (lease.mac, lease)
+    })
 
-    for lease in try Self.retrieveRawLeases(fromString).compactMap({ Lease(fromRawLease: $0) }) {
-      leases[lease.mac] = lease
+    self.leases = Dictionary(leases) { (left, right) in
+      // When duplicate lease is found, prefer a newer lease over the older one
+      (left.expiresAt > right.expiresAt) ? left : right
     }
-
-    self.leases = leases
   }
 
   /// Parse leases from the host cache similarly to the PLCache_read() function found in Apple's Open Source releases.
@@ -107,7 +112,7 @@ class Leases {
     return rawLeases
   }
 
-  func ResolveMACAddress(macAddress: MACAddress) throws -> IPv4Address? {
+  func ResolveMACAddress(macAddress: MACAddress) -> IPv4Address? {
     leases[macAddress]?.ip
   }
 }

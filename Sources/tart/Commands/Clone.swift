@@ -8,7 +8,7 @@ struct Clone: AsyncParsableCommand {
     discussion: """
     Creates a local virtual machine by cloning either a remote or another local virtual machine.
 
-    Due to copy-on-write magic in Apple File System a cloned VM won't actually claim all the space right away.
+    Due to copy-on-write magic in Apple File System, a cloned VM won't actually claim all the space right away.
     Only changes to a cloned disk will be written and claim new space. By default, Tart checks available capacity
     in Tart's home directory and checks if there is enough space for the worst possible scenario: when the whole disk
     will be modified.
@@ -18,7 +18,7 @@ struct Clone: AsyncParsableCommand {
     """
   )
 
-  @Argument(help: "source VM name")
+  @Argument(help: "source VM name", completion: .custom(completeMachines))
   var sourceName: String
 
   @Argument(help: "new VM name")
@@ -63,7 +63,7 @@ struct Clone: AsyncParsableCommand {
       try lock.lock()
 
       let generateMAC = try localStorage.hasVMsWithMACAddress(macAddress: sourceVM.macAddress())
-        && sourceVM.state() != "suspended"
+        && sourceVM.state() != .Suspended
       try sourceVM.clone(to: tmpVMDir, generateMAC: generateMAC)
 
       try localStorage.move(newName, from: tmpVMDir)
@@ -73,7 +73,7 @@ struct Clone: AsyncParsableCommand {
       // APFS is doing copy-on-write so the above cloning operation (just copying files on disk)
       // is not actually claiming new space until the VM is started and it writes something to disk.
       // So once we clone the VM let's try to claim a little bit of space for the VM to run.
-      try Prune.reclaimIfNeeded(UInt64(sourceVM.sizeBytes()), sourceVM)
+      try Prune.reclaimIfNeeded(UInt64(sourceVM.allocatedSizeBytes()), sourceVM)
     }, onCancel: {
       try? FileManager.default.removeItem(at: tmpVMDir.baseURL)
     })

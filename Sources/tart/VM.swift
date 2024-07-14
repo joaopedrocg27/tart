@@ -1,6 +1,7 @@
 import Foundation
 import Virtualization
 import AsyncAlgorithms
+import Semaphore
 
 struct UnsupportedRestoreImageError: Error {
 }
@@ -30,7 +31,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
   var configuration: VZVirtualMachineConfiguration
 
   // Semaphore used to communicate with the VZVirtualMachineDelegate
-  var sema = DispatchSemaphore(value: 0)
+  var sema = AsyncSemaphore(value: 0)
 
   // VM's config
   var name: String
@@ -45,7 +46,9 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
        additionalStorageDevices: [VZStorageDeviceConfiguration] = [],
        directorySharingDevices: [VZDirectorySharingDeviceConfiguration] = [],
        serialPorts: [VZSerialPortConfiguration] = [],
-       suspendable: Bool = false
+       suspendable: Bool = false,
+       audio: Bool = true,
+       clipboard: Bool = true
   ) throws {
     name = vmDir.name
     config = try VMConfig.init(fromURL: vmDir.configURL)
@@ -61,7 +64,9 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
                                                 network: network, additionalStorageDevices: additionalStorageDevices,
                                                 directorySharingDevices: directorySharingDevices,
                                                 serialPorts: serialPorts,
-                                                suspendable: suspendable
+                                                suspendable: suspendable,
+                                                audio: audio,
+                                                clipboard: clipboard
     )
     virtualMachine = VZVirtualMachine(configuration: configuration)
 
@@ -89,12 +94,17 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     // Download the IPSW
     defaultLogger.appendNewLine("Fetching \(remoteURL.lastPathComponent)...")
 
-    let (channel, response) = try await Fetcher.fetch(URLRequest(url: remoteURL), viaFile: true)
+    let downloadProgress = Progress(totalUnitCount: 100)
+    ProgressObserver(downloadProgress).log(defaultLogger)
 
-    let progress = Progress(totalUnitCount: response.expectedContentLength)
-    ProgressObserver(progress).log(defaultLogger)
+    let request = URLRequest(url: remoteURL)
+    let (channel, response) = try await Fetcher.fetch(request, viaFile: true, progress: downloadProgress)
 
     let temporaryLocation = try Config().tartTmpDir.appendingPathComponent(UUID().uuidString + ".ipsw")
+    defaultLogger.appendNewLine("Computing digest for \(temporaryLocation.path)...")
+    let digestProgress = Progress(totalUnitCount: response.expectedContentLength)
+    ProgressObserver(digestProgress).log(defaultLogger)
+
     FileManager.default.createFile(atPath: temporaryLocation.path, contents: nil)
     let lock = try FileLock(lockURL: temporaryLocation)
     try lock.lock()
@@ -106,7 +116,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
       let chunkAsData = Data(chunk)
       fileHandle.write(chunkAsData)
       digest.update(chunkAsData)
-      progress.completedUnitCount += Int64(chunk.count)
+      digestProgress.completedUnitCount += Int64(chunk.count)
     }
 
     try fileHandle.close()
@@ -114,18 +124,6 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     let finalLocation = try IPSWCache().locationFor(fileName: digest.finalize() + ".ipsw")
 
     return try FileManager.default.replaceItemAt(finalLocation, withItemAt: temporaryLocation)!
-  }
-
-  static func latestIPSWURL() async throws -> URL {
-    defaultLogger.appendNewLine("Looking up the latest supported IPSW...")
-
-    let image = try await withCheckedThrowingContinuation { continuation in
-      VZMacOSRestoreImage.fetchLatestSupported() { result in
-        continuation.resume(with: result)
-      }
-    }
-
-    return image.url
   }
 
   var inFinalState: Bool {
@@ -137,82 +135,90 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     }
   }
 
-  init(
-    vmDir: VMDirectory,
-    ipswURL: URL,
-    diskSizeGB: UInt16,
-    network: Network = NetworkShared(),
-    additionalStorageDevices: [VZStorageDeviceConfiguration] = [],
-    directorySharingDevices: [VZDirectorySharingDeviceConfiguration] = [],
-    serialPorts: [VZSerialPortConfiguration] = []
-  ) async throws {
-    var ipswURL = ipswURL
+  #if arch(arm64)
+    init(
+      vmDir: VMDirectory,
+      ipswURL: URL,
+      diskSizeGB: UInt16,
+      network: Network = NetworkShared(),
+      additionalStorageDevices: [VZStorageDeviceConfiguration] = [],
+      directorySharingDevices: [VZDirectorySharingDeviceConfiguration] = [],
+      serialPorts: [VZSerialPortConfiguration] = []
+    ) async throws {
+      var ipswURL = ipswURL
 
-    if !ipswURL.isFileURL {
-      ipswURL = try await VM.retrieveIPSW(remoteURL: ipswURL)
-    }
-
-    // We create a temporary TART_HOME directory in tests, which has its "cache" folder symlinked
-    // to the users Tart cache directory (~/.tart/cache). However, the Virtualization.Framework
-    // cannot deal with paths that contain symlinks, so expand them here first.
-    ipswURL.resolveSymlinksInPath()
-
-    // Load the restore image and try to get the requirements
-    // that match both the image and our platform
-    let image = try await withCheckedThrowingContinuation { continuation in
-      VZMacOSRestoreImage.load(from: ipswURL) { result in
-        continuation.resume(with: result)
+      if !ipswURL.isFileURL {
+        ipswURL = try await VM.retrieveIPSW(remoteURL: ipswURL)
       }
-    }
 
-    guard let requirements = image.mostFeaturefulSupportedConfiguration else {
-      throw UnsupportedRestoreImageError()
-    }
+      // We create a temporary TART_HOME directory in tests, which has its "cache" folder symlinked
+      // to the users Tart cache directory (~/.tart/cache). However, the Virtualization.Framework
+      // cannot deal with paths that contain symlinks, so expand them here first.
+      ipswURL.resolveSymlinksInPath()
 
-    // Create NVRAM
-    _ = try VZMacAuxiliaryStorage(creatingStorageAt: vmDir.nvramURL, hardwareModel: requirements.hardwareModel)
-
-    // Create disk
-    try vmDir.resizeDisk(diskSizeGB)
-
-    name = vmDir.name
-    // Create config
-    config = VMConfig(
-      platform: Darwin(ecid: VZMacMachineIdentifier(), hardwareModel: requirements.hardwareModel),
-      cpuCountMin: requirements.minimumSupportedCPUCount,
-      memorySizeMin: requirements.minimumSupportedMemorySize
-    )
-    // allocate at least 4 CPUs because otherwise VMs are frequently freezing
-    try config.setCPU(cpuCount: max(4, requirements.minimumSupportedCPUCount))
-    try config.save(toURL: vmDir.configURL)
-
-    // Initialize the virtual machine and its configuration
-    self.network = network
-    configuration = try Self.craftConfiguration(diskURL: vmDir.diskURL, nvramURL: vmDir.nvramURL,
-                                                vmConfig: config, network: network,
-                                                additionalStorageDevices: additionalStorageDevices,
-                                                directorySharingDevices: directorySharingDevices,
-                                                serialPorts: serialPorts
-    )
-    virtualMachine = VZVirtualMachine(configuration: configuration)
-
-    super.init()
-    virtualMachine.delegate = self
-
-    // Run automated installation
-    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-      DispatchQueue.main.async { [ipswURL] in
-        let installer = VZMacOSInstaller(virtualMachine: self.virtualMachine, restoringFromImageAt: ipswURL)
-
-        defaultLogger.appendNewLine("Installing OS...")
-        ProgressObserver(installer.progress).log(defaultLogger)
-
-        installer.install { result in
+      // Load the restore image and try to get the requirements
+      // that match both the image and our platform
+      let image = try await withCheckedThrowingContinuation { continuation in
+        VZMacOSRestoreImage.load(from: ipswURL) { result in
           continuation.resume(with: result)
         }
       }
+
+      guard let requirements = image.mostFeaturefulSupportedConfiguration else {
+        throw UnsupportedRestoreImageError()
+      }
+
+      // Create NVRAM
+      _ = try VZMacAuxiliaryStorage(creatingStorageAt: vmDir.nvramURL, hardwareModel: requirements.hardwareModel)
+
+      // Create disk
+      try vmDir.resizeDisk(diskSizeGB)
+
+      name = vmDir.name
+      // Create config
+      config = VMConfig(
+        platform: Darwin(ecid: VZMacMachineIdentifier(), hardwareModel: requirements.hardwareModel),
+        cpuCountMin: requirements.minimumSupportedCPUCount,
+        memorySizeMin: requirements.minimumSupportedMemorySize
+      )
+      // allocate at least 4 CPUs because otherwise VMs are frequently freezing
+      try config.setCPU(cpuCount: max(4, requirements.minimumSupportedCPUCount))
+      try config.save(toURL: vmDir.configURL)
+
+      // Initialize the virtual machine and its configuration
+      self.network = network
+      configuration = try Self.craftConfiguration(diskURL: vmDir.diskURL, nvramURL: vmDir.nvramURL,
+                                                  vmConfig: config, network: network,
+                                                  additionalStorageDevices: additionalStorageDevices,
+                                                  directorySharingDevices: directorySharingDevices,
+                                                  serialPorts: serialPorts
+      )
+      virtualMachine = VZVirtualMachine(configuration: configuration)
+
+      super.init()
+      virtualMachine.delegate = self
+
+      // Run automated installation
+      try await install(ipswURL)
     }
-  }
+
+    @MainActor
+    private func install(_ url: URL) async throws {
+      let installer = VZMacOSInstaller(virtualMachine: self.virtualMachine, restoringFromImageAt: url)
+      defaultLogger.appendNewLine("Installing OS...")
+      ProgressObserver(installer.progress).log(defaultLogger)
+
+      try await withTaskCancellationHandler(operation: {
+        try await withCheckedThrowingContinuation { continuation in
+          installer.install { result in
+            continuation.resume(with: result)
+          }
+        }
+      }, onCancel: {
+        installer.progress.cancel()
+      })
+    }
+  #endif
 
   @available(macOS 13, *)
   static func linux(vmDir: VMDirectory, diskSizeGB: UInt16) async throws -> VM {
@@ -240,16 +246,18 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
   }
 
   func run() async throws {
-    await withTaskCancellationHandler(operation: {
-      // Wait for the VM to finish running
-      // or for the exit condition
-      sema.wait()
-    }, onCancel: {
-      sema.signal()
-    })
+    do {
+      try await sema.waitUnlessCancelled()
+    } catch is CancellationError {
+      // Triggered by "tart stop", Ctrl+C, or closing the
+      // VM window, so shut down the VM gracefully below.
+    }
 
     if Task.isCancelled {
-      try await stop()
+      if (self.virtualMachine.state == VZVirtualMachine.State.running) {
+        print("Stopping VM...")
+        try await stop()
+      }
     }
 
     try await network.stop()
@@ -257,9 +265,13 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
 
   @MainActor
   private func start(_ recovery: Bool) async throws {
-    let startOptions = VZMacOSVirtualMachineStartOptions()
-    startOptions.startUpFromMacOSRecovery = recovery
-    try await virtualMachine.start(options: startOptions)
+    #if arch(arm64)
+      let startOptions = VZMacOSVirtualMachineStartOptions()
+      startOptions.startUpFromMacOSRecovery = recovery
+      try await virtualMachine.start(options: startOptions)
+    #else
+      try await virtualMachine.start()
+    #endif
   }
 
   @MainActor
@@ -280,7 +292,9 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     additionalStorageDevices: [VZStorageDeviceConfiguration],
     directorySharingDevices: [VZDirectorySharingDeviceConfiguration],
     serialPorts: [VZSerialPortConfiguration],
-    suspendable: Bool = false
+    suspendable: Bool = false,
+    audio: Bool = true,
+    clipboard: Bool = true
   ) throws -> VZVirtualMachineConfiguration {
     let configuration = VZVirtualMachineConfiguration()
 
@@ -298,7 +312,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     configuration.graphicsDevices = [vmConfig.platform.graphicsDevice(vmConfig: vmConfig)]
 
     // Audio
-    if !suspendable {
+    if audio && !suspendable {
       let soundDeviceConfiguration = VZVirtioSoundDeviceConfiguration()
       let inputAudioStreamConfiguration = VZVirtioSoundDeviceInputStreamConfiguration()
       inputAudioStreamConfiguration.source = VZHostAudioInputStreamSource()
@@ -309,13 +323,8 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     }
 
     // Keyboard and mouse
-    if suspendable, let platformSuspendable = vmConfig.platform.self as? PlatformSuspendable {
-      configuration.keyboards = platformSuspendable.keyboardsSuspendable()
-      configuration.pointingDevices = platformSuspendable.pointingDevicesSuspendable()
-    } else {
-      configuration.keyboards = vmConfig.platform.keyboards()
-      configuration.pointingDevices = vmConfig.platform.pointingDevices()
-    }
+    configuration.keyboards = vmConfig.platform.keyboards()
+    configuration.pointingDevices = vmConfig.platform.pointingDevices()
 
     // Networking
     configuration.networkDevices = network.attachments().map {
@@ -325,10 +334,29 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
       return vio
     }
 
+    // Clipboard sharing via Spice agent
+    if clipboard && vmConfig.os == .linux {
+      let spiceAgentConsoleDevice = VZVirtioConsoleDeviceConfiguration()
+      let spiceAgentPort = VZVirtioConsolePortConfiguration()
+      spiceAgentPort.name = VZSpiceAgentPortAttachment.spiceAgentPortName
+      spiceAgentPort.attachment = VZSpiceAgentPortAttachment()
+      spiceAgentConsoleDevice.ports[0] = spiceAgentPort
+      configuration.consoleDevices.append(spiceAgentConsoleDevice)
+    }
+
     // Storage
-    var devices: [VZStorageDeviceConfiguration] = [
-      VZVirtioBlockDeviceConfiguration(attachment: try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false))
-    ]
+    let attachment: VZDiskImageStorageDeviceAttachment = vmConfig.os == .linux ?
+      // Use "cached" caching mode for virtio drive to prevent fs corruption on linux
+      try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false, cachingMode: .cached, synchronizationMode: .full) :
+      try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false)
+
+    var device: VZStorageDeviceConfiguration
+    if #available(macOS 14, *), vmConfig.os == .linux {
+      device = VZNVMExpressControllerDeviceConfiguration(attachment: attachment)
+    } else {
+      device = VZVirtioBlockDeviceConfiguration(attachment: attachment)
+    }
+    var devices: [VZStorageDeviceConfiguration] = [device]
     devices.append(contentsOf: additionalStorageDevices)
     configuration.storageDevices = devices
 

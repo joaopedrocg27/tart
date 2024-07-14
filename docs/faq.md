@@ -1,21 +1,13 @@
 ---
 hide:
   - navigation
+title: Frequently Asked Questions
+description: Advanced configuration and troubleshooting tips for advanced configurations.
 ---
-
-## How Tart is different from Anka?
-
-Under the hood Tart is using the same technology as Anka 3.0 so there should be no real difference in performance
-or features supported. If there is some feature missing please don't hesitate to [create a feature request](https://github.com/cirruslabs/tart/issues).
-
-Instead of Anka Registry, Tart can work with any OCI-compatible container registry. This provides a much more consistent
-and scalable experience for distributing virtual machines.
-
-Tart doesn't yet have an analogue of Anka Controller for managing long living VMs but [soon will be](https://github.com/cirruslabs/tart/issues/372).
 
 ## VM location on disk
 
-Tart stores all it's files in `~/.tart/` directory. Local images that you can run are stored in `~/.tart/vms/`.
+Tart stores all its files in `~/.tart/` directory. Local images that you can run are stored in `~/.tart/vms/`.
 Remote images are pulled into `~/.tart/cache/OCIs/`.
 
 ## Nested virtualization support?
@@ -66,3 +58,35 @@ sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.InternetS
 ```
 
 Note that this tweak persists across reboots, so normally you'll only need to do it once per new host.
+
+## Running login/clone/pull/push commands over SSH
+
+When invoking the Tart in an SSH session, you might get error like this:
+
+>Keychain returned unsuccessful status -25308
+
+...or this:
+
+>Keychain failed to update item: User interaction is not allowed.
+
+This is because Tart uses [Keychain](https://en.wikipedia.org/wiki/Keychain_(software)) to store and retrieve OCI registry credentials by default, but Keychain is only automatically/semi-automatically unlocked in GUI sessions.
+
+To unlock the Keychain in an SSH session, run the following command, which will ask for your user's password:
+
+```shell
+security unlock-keychain
+```
+
+This command also supports the `-p` command-line argument that allows you to supply the password and unlock non-interactively, which is great for scripts.
+
+If that doesn't work for you for some reason, you can pass the credentials via the environment variables, see [Registry Authorization](integrations/vm-management.md#registry-authorization) for more details on how to do that.
+
+## How Tart is different from Anka?
+
+Under the hood Tart is using the same technology as Anka 3.0 so there should be no real difference in performance
+or features supported. If there is some feature missing please don't hesitate to [create a feature request](https://github.com/cirruslabs/tart/issues).
+
+Instead of Anka Registry, Tart can work with any OCI-compatible container registry. This provides a much more consistent
+and scalable experience for distributing virtual machines.
+
+Tart doesn't yet have an analogue of Anka Controller for managing long living VMs but [soon will be](https://github.com/cirruslabs/tart/issues/372).

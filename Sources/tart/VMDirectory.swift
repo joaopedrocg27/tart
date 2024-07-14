@@ -3,6 +3,12 @@ import Virtualization
 import CryptoKit
 
 struct VMDirectory: Prunable {
+  enum State: String {
+    case Running = "running"
+    case Suspended = "suspended"
+    case Stopped = "stopped"
+  }
+
   var baseURL: URL
 
   var configURL: URL {
@@ -30,26 +36,30 @@ struct VMDirectory: Prunable {
     baseURL
   }
 
+  func lock() throws -> PIDLock {
+    try PIDLock(lockURL: configURL)
+  }
+
   func running() throws -> Bool {
     // The most common reason why PIDLock() instantiation fails is a race with "tart delete" (ENOENT),
     // which is fine to report as "not running".
     //
     // The other reasons are unlikely and the cost of getting a false positive is way less than
     // the cost of crashing with an exception when calling "tart list" on a busy machine, for example.
-    guard let lock = try? PIDLock(lockURL: configURL) else {
+    guard let lock = try? lock() else {
       return false
     }
 
     return try lock.pid() != 0
   }
 
-  func state() throws -> String {
+  func state() throws -> State {
     if try running() {
-      return "running"
+      return State.Running
     } else if FileManager.default.fileExists(atPath: stateURL.path) {
-      return "suspended"
+      return State.Suspended
     } else {
-      return "stopped"
+      return State.Stopped
     }
   }
 
@@ -130,18 +140,43 @@ struct VMDirectory: Prunable {
     if !FileManager.default.fileExists(atPath: diskURL.path) {
       FileManager.default.createFile(atPath: diskURL.path, contents: nil, attributes: nil)
     }
+
     let diskFileHandle = try FileHandle.init(forWritingTo: diskURL)
-    // macOS considers kilo being 1000 and not 1024
-    try diskFileHandle.truncate(atOffset: UInt64(sizeGB) * 1000 * 1000 * 1000)
+    let currentDiskFileLength = try diskFileHandle.seekToEnd()
+    let desiredDiskFileLength = UInt64(sizeGB) * 1000 * 1000 * 1000
+    if desiredDiskFileLength < currentDiskFileLength {
+      let currentLengthHuman = ByteCountFormatter().string(fromByteCount: Int64(currentDiskFileLength))
+      let desiredLengthHuman = ByteCountFormatter().string(fromByteCount: Int64(desiredDiskFileLength))
+      throw RuntimeError.InvalidDiskSize("new disk size of \(desiredLengthHuman) should be larger " +
+        "than the current disk size of \(currentLengthHuman)")
+    } else if desiredDiskFileLength > currentDiskFileLength {
+      try diskFileHandle.truncate(atOffset: desiredDiskFileLength)
+    }
     try diskFileHandle.close()
   }
 
   func delete() throws {
+    let lock = try lock()
+
+    if try !lock.trylock() {
+      throw RuntimeError.VMIsRunning(name)
+    }
+
     try FileManager.default.removeItem(at: baseURL)
+
+    try lock.unlock()
   }
 
   func accessDate() throws -> Date {
     try baseURL.accessDate()
+  }
+
+  func allocatedSizeBytes() throws -> Int {
+    try configURL.allocatedSizeBytes() + diskURL.allocatedSizeBytes() + nvramURL.allocatedSizeBytes()
+  }
+
+  func allocatedSizeGB() throws -> Int {
+    try allocatedSizeBytes() / 1000 / 1000 / 1000
   }
 
   func sizeBytes() throws -> Int {

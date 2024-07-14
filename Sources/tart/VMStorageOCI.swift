@@ -1,5 +1,6 @@
 import Foundation
 import Sentry
+import Retry
 
 class VMStorageOCI: PrunableStorage {
   let baseURL = try! Config().tartCacheDir.appendingPathComponent("OCIs", isDirectory: true)
@@ -112,6 +113,10 @@ class VMStorageOCI: PrunableStorage {
         continue
       }
 
+      // Split the relative VM's path at the last component
+      // and figure out which character should be used
+      // to join them together, either ":" for tags or
+      // "@" for hashes
       let parts = [foundURL.deletingLastPathComponent().relativePath, foundURL.lastPathComponent]
       var name: String
 
@@ -121,6 +126,9 @@ class VMStorageOCI: PrunableStorage {
       } else {
         name = parts.joined(separator: "@")
       }
+
+      // Remove the percent-encoding, if any
+      name = percentDecode(name)
 
       result.append((name, vmDir, isSymlink))
     }
@@ -134,7 +142,7 @@ class VMStorageOCI: PrunableStorage {
 
   func pull(_ name: RemoteName, registry: Registry, concurrency: UInt) async throws {
     SentrySDK.configureScope { scope in
-      scope.setContext(value: ["imageName": name], key: "OCI")
+      scope.setContext(value: ["imageName": name.description], key: "OCI")
     }
 
     defaultLogger.appendNewLine("pulling manifest...")
@@ -188,7 +196,23 @@ class VMStorageOCI: PrunableStorage {
       }
 
       try await withTaskCancellationHandler(operation: {
-        try await tmpVMDir.pullFromRegistry(registry: registry, manifest: manifest, concurrency: concurrency)
+        try await retry(maxAttempts: 5, backoff: .exponentialWithFullJitter(baseDelay: .seconds(5), maxDelay: .seconds(60))) {
+          var localLayerCache: LocalLayerCache? = nil
+
+          if name.reference.type == .Tag,
+             let vmDir = try? open(name),
+             let digest = try? digest(name),
+             let (manifest, _) = try? await registry.pullManifest(reference: digest) {
+            localLayerCache = try LocalLayerCache(vmDir.diskURL, manifest)
+          }
+
+          try await tmpVMDir.pullFromRegistry(registry: registry, manifest: manifest, concurrency: concurrency, localLayerCache: localLayerCache)
+        } recoverFromFailure: { error in
+          print("Error: \(error.localizedDescription)")
+          print("Attempting to re-try...")
+
+          return .retry
+        }
         try move(digestName, from: tmpVMDir)
         transaction.finish()
       }, onCancel: {
@@ -219,9 +243,7 @@ class VMStorageOCI: PrunableStorage {
   }
 
   func link(from: RemoteName, to: RemoteName) throws {
-    if FileManager.default.fileExists(atPath: vmURL(from).path) {
-      try FileManager.default.removeItem(at: vmURL(from))
-    }
+    try? FileManager.default.removeItem(at: vmURL(from))
 
     try FileManager.default.createSymbolicLink(at: vmURL(from), withDestinationURL: vmURL(to))
 
@@ -233,7 +255,7 @@ extension URL {
   func appendingRemoteName(_ name: RemoteName) -> URL {
     var result: URL = self
 
-    for pathComponent in (name.host + "/" + name.namespace + "/" + name.reference.value).split(separator: "/") {
+    for pathComponent in (percentEncode(name.host) + "/" + name.namespace + "/" + name.reference.value).split(separator: "/") {
       result = result.appendingPathComponent(String(pathComponent))
     }
 
@@ -241,6 +263,23 @@ extension URL {
   }
 
   func appendingHost(_ name: RemoteName) -> URL {
-    self.appendingPathComponent(name.host, isDirectory: true)
+    self.appendingPathComponent(percentEncode(name.host), isDirectory: true)
   }
+}
+
+// Work around a pretty inane Swift's URL behavior where calling
+// appendingPathComponent() or deletingLastPathComponent() on a
+// URL like URL(filePath: "example.com:8080") (note the "filePath")
+// will flip its isFileURL from "true" to "false" and discard its
+// absolute path infromation (if any).
+//
+// The same kind of operations won't do anything to a URL like
+// URL(filePath: "127.0.0.1:8080"), which makes things even more
+// ridiculous.
+private func percentEncode(_ s: String) -> String {
+  return s.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: ":").inverted)!
+}
+
+private func percentDecode(_ s: String) -> String {
+  s.removingPercentEncoding!
 }

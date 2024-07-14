@@ -1,3 +1,4 @@
+import Compression
 import Foundation
 import Sentry
 
@@ -13,15 +14,7 @@ extension VMDirectory {
   private static let bufferSizeBytes = 64 * 1024 * 1024
   private static let layerLimitBytes = 500 * 1000 * 1000
 
-  func pullFromRegistry(registry: Registry, reference: String, concurrency: UInt) async throws {
-    defaultLogger.appendNewLine("pulling manifest...")
-
-    let (manifest, _) = try await registry.pullManifest(reference: reference)
-
-    return try await pullFromRegistry(registry: registry, manifest: manifest, concurrency: concurrency)
-  }
-
-  func pullFromRegistry(registry: Registry, manifest: OCIManifest, concurrency: UInt) async throws {
+  func pullFromRegistry(registry: Registry, manifest: OCIManifest, concurrency: UInt, localLayerCache: LocalLayerCache?) async throws {
     // Pull VM's config file layer and re-serialize it into a config file
     let configLayers = manifest.layers.filter {
       $0.mediaType == configMediaType
@@ -61,7 +54,13 @@ extension VMDirectory {
     let progress = Progress(totalUnitCount: diskCompressedSize)
     ProgressObserver(progress).log(defaultLogger)
 
-    try await diskImplType.pull(registry: registry, diskLayers: layers, diskURL: diskURL, concurrency: concurrency, progress: progress)
+    do {
+      try await diskImplType.pull(registry: registry, diskLayers: layers, diskURL: diskURL,
+                                  concurrency: concurrency, progress: progress,
+                                  localLayerCache: localLayerCache)
+    } catch let error where error is FilterError {
+      throw RuntimeError.PullFailed("failed to decompress disk: \(error.localizedDescription)")
+    }
 
     // Pull VM's NVRAM file layer and store it in an NVRAM file
     defaultLogger.appendNewLine("pulling NVRAM...")

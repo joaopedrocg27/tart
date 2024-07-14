@@ -95,7 +95,14 @@ struct VMConfig: Codable {
     arch = try container.decodeIfPresent(Architecture.self, forKey: .arch) ?? .arm64
     switch os {
     case .darwin:
-      platform = try Darwin(from: decoder)
+      #if arch(arm64)
+        platform = try Darwin(from: decoder)
+      #else
+        throw DecodingError.dataCorruptedError(
+          forKey: .os,
+          in: container,
+          debugDescription: "Darwin VMs are only supported on Apple Silicon hosts")
+      #endif
     case .linux:
       platform = try Linux(from: decoder)
     }
@@ -132,8 +139,13 @@ struct VMConfig: Codable {
   }
 
   mutating func setCPU(cpuCount: Int) throws {
-    if cpuCount < cpuCountMin {
+    if os == .darwin && cpuCount < cpuCountMin {
       throw LessThanMinimalResourcesError("VM should have \(cpuCountMin) CPU cores"
+        + " at minimum (requested \(cpuCount))")
+    }
+
+    if cpuCount < VZVirtualMachineConfiguration.minimumAllowedCPUCount {
+      throw LessThanMinimalResourcesError("VM should have \(VZVirtualMachineConfiguration.minimumAllowedCPUCount) CPU cores"
         + " at minimum (requested \(cpuCount))")
     }
 
@@ -141,8 +153,13 @@ struct VMConfig: Codable {
   }
 
   mutating func setMemory(memorySize: UInt64) throws {
-    if memorySize < memorySizeMin {
+    if os == .darwin && memorySize < memorySizeMin {
       throw LessThanMinimalResourcesError("VM should have \(memorySizeMin) bytes"
+        + " of memory at minimum (requested \(memorySize))")
+    }
+
+    if memorySize < VZVirtualMachineConfiguration.minimumAllowedMemorySize {
+      throw LessThanMinimalResourcesError("VM should have \(VZVirtualMachineConfiguration.minimumAllowedMemorySize) bytes"
         + " of memory at minimum (requested \(memorySize))")
     }
 

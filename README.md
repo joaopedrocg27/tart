@@ -8,46 +8,32 @@ Built by CI engineers for your automation needs. Here are some highlights of Tar
 * Use Tart Packer Plugin to automate VM creation.
 * Easily integrates with any CI system.
 
-Tart powers [Cirrus Runners](https://tart.run/integrations/github-actions/?utm_source=github&utm_medium=referral)
+Tart powers [Cirrus Runners](https://cirrus-runners.app/)
 service — a drop-in replacement for the standard GitHub-hosted runners, offering 2-3 times better performance for a fraction of the price.
 
 <p align="center">
-  <a href="https://tart.run/integrations/github-actions/?utm_source=github&utm_medium=referral" target=_blank>
+  <a href="https://cirrus-runners.app/?utm_source=github&utm_medium=referral" target=_blank>
     <img src="https://github.com/cirruslabs/tart/raw/main/Resources/CirrusRunnersForGHA.png" height="65"/>
   </a>
 </p>
 
-Tart is also adopted by several other automation services:
+Many companies are using Tart in their internal setups. Here are a few of them:
 
 <p align="center">
-  <a href="https://cirrus-ci.org/guide/macOS/" target=_blank>
-    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/CirrusCI.png" height="65"/>
+  <a href="https://atlassian.com/" target=_blank>
+    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/Atlassian.png" height="65"/>
   </a>
-  <a href="https://codemagic.io/" target=_blank>
-    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/Codemagic.png" height="65"/>
-  </a>
-  <a href="https://testingbot.com/" target=_blank>
-    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/TestingBot.png" height="65"/>
-  </a>
-</p>
-
-Many more companies are using Tart in their internal setups. Here are a few of them:
-
-<p align="center">
-  <a href="https://ahrefs.com/" target=_blank>
-    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/ahrefs.png" height="65"/>
-  </a>
-  <a href="https://krisp.ai/" target=_blank>
-    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/Krisp.png" height="65"/>
+  <a href="https://www.figma.com/" target=_blank>
+    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/Figma.png" height="65"/>
   </a>
   <a href="https://mullvad.net/" target=_blank>
     <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/Mullvad.png" height="65"/>
   </a>
-  <a href="https://shape.dk/" target=_blank>
-    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/shape.png" height="65"/>
+  <a href="https://krisp.ai/" target=_blank>
+    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/Krisp.png" height="65"/>
   </a>
-  <a href="https://suran.com/" target=_blank>
-    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/Suran.png" height="65"/>
+  <a href="https://testingbot.com/" target=_blank>
+    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/TestingBot.png" height="65"/>
   </a>
   <a href="https://symflower.com/" target=_blank>
     <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/Symflower.png" height="65"/>
@@ -55,15 +41,21 @@ Many more companies are using Tart in their internal setups. Here are a few of t
   <a href="https://transloadit.com/" target=_blank>
     <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/Transloadit.png" height="65"/>
   </a>
-  <a href="https://uphold.com/" target=_blank>
-    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/Uphold.png" height="65"/>
+  <a href="https://cirrus-ci.org/" target=_blank>
+    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/CirrusCI.png" height="65"/>
   </a>
   <a href="https://www.pitsdatarecovery.net/" target=_blank>
     <img src="https://github.com/cirruslabs/tart/raw/main/Resources/Users/PITSGlobalDataRecoveryServices.png" height="65"/>
   </a>
 </p>
 
-**Note:** If your company or project is using Tart please consider [adding yourself to the list above](/Resources/Users/HowToAddYourself.md).
+**Note:** If your company or project is using Tart please consider [sharing with the community](https://github.com/cirruslabs/tart/discussions/857).
+
+<p align="center">
+  <a href="https://aws.amazon.com/marketplace/pp/prodview-qczco34wlkdws?utm_source=github&utm_medium=referral" target=_blank>
+    <img src="https://github.com/cirruslabs/tart/raw/main/Resources/AWSMarkeplaceLogo.png" height="90"/>
+  </a>
+</p>
 
 ## Usage
 
