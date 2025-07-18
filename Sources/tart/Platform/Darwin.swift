@@ -8,7 +8,7 @@ struct UnsupportedHostOSError: Error, CustomStringConvertible {
 
 #if arch(arm64)
 
-  struct Darwin: Platform {
+  struct Darwin: PlatformSuspendable {
     var ecid: VZMacMachineIdentifier
     var hardwareModel: VZMacHardwareModel
 
@@ -38,7 +38,7 @@ struct UnsupportedHostOSError: Error, CustomStringConvertible {
         throw DecodingError.dataCorruptedError(forKey: .hardwareModel, in: container, debugDescription: "")
       }
       guard let hardwareModel = VZMacHardwareModel.init(dataRepresentation: data) else {
-        throw DecodingError.dataCorruptedError(forKey: .hardwareModel, in: container, debugDescription: "")
+        throw UnsupportedHostOSError()
       }
       self.hardwareModel = hardwareModel
     }
@@ -58,7 +58,11 @@ struct UnsupportedHostOSError: Error, CustomStringConvertible {
       VZMacOSBootLoader()
     }
 
-    func platform(nvramURL: URL) throws -> VZPlatformConfiguration {
+    func platform(nvramURL: URL, needsNestedVirtualization: Bool) throws -> VZPlatformConfiguration {
+      if needsNestedVirtualization {
+        throw RuntimeError.VMConfigurationError("macOS virtual machines do not support nested virtualization")
+      }
+
       let result = VZMacPlatformConfiguration()
 
       result.machineIdentifier = ecid
@@ -103,18 +107,37 @@ struct UnsupportedHostOSError: Error, CustomStringConvertible {
     func keyboards() -> [VZKeyboardConfiguration] {
       if #available(macOS 14, *) {
         // Mac keyboard is only supported by guests starting with macOS Ventura
-        return [VZMacKeyboardConfiguration()]
+        return [VZUSBKeyboardConfiguration(), VZMacKeyboardConfiguration()]
       } else {
         return [VZUSBKeyboardConfiguration()]
       }
     }
 
+    func keyboardsSuspendable() -> [VZKeyboardConfiguration] {
+      if #available(macOS 14, *) {
+        return [VZMacKeyboardConfiguration()]
+      } else {
+        // fallback to the regular configuration
+        return keyboards()
+      }
+    }
+
     func pointingDevices() -> [VZPointingDeviceConfiguration] {
-      if #available(macOS 13, *) {
+      // Trackpad is only supported by guests starting with macOS Ventura
+      [VZUSBScreenCoordinatePointingDeviceConfiguration(), VZMacTrackpadConfiguration()]
+    }
+
+    func pointingDevicesSimplified() -> [VZPointingDeviceConfiguration] {
+      // Only include the USB pointing device, not the trackpad
+      return [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+    }
+
+    func pointingDevicesSuspendable() -> [VZPointingDeviceConfiguration] {
+      if #available(macOS 14, *) {
         return [VZMacTrackpadConfiguration()]
       } else {
         // fallback to the regular configuration
-        return [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        return pointingDevices()
       }
     }
   }

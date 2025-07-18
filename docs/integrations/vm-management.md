@@ -7,7 +7,7 @@ description: Use Packer to build custom VM images, configure VMs and work with r
 
 ## Creating from scratch
 
-Tart supports macOS and Linux virtual machines. All commands like `run` and `pull` work the same way regarding of the underlying OS a particular VM image has.
+Tart supports macOS and Linux virtual machines. All commands like `run` and `pull` work the same way regardless of the underlying OS a particular VM image has.
 The only difference is how such VM images are created. Please check sections below for [macOS](#creating-a-macos-vm-image-from-scratch) and [Linux](#creating-a-linux-vm-image-from-scratch) instructions.
 
 ### Creating a macOS VM image from scratch
@@ -16,8 +16,8 @@ Tart can create VMs from `*.ipsw` files. You can download a specific `*.ipsw` fi
 use `latest` instead of a path to `*.ipsw` to download the latest available version:
 
 ```bash
-tart create --from-ipsw=latest sonoma-vanilla
-tart run sonoma-vanilla
+tart create --from-ipsw=latest sequoia-vanilla
+tart run sequoia-vanilla
 ```
 
 After the initial booting of the VM, you'll need to manually go through the macOS installation process. As a convention we recommend creating an `admin` user with an `admin` password. After the regular installation please do some additional modifications in the VM:
@@ -72,8 +72,8 @@ packer {
 }
 
 source "tart-cli" "tart" {
-  vm_base_name = "ghcr.io/cirruslabs/macos-sonoma-base:latest"
-  vm_name      = "my-custom-sonoma"
+  vm_base_name = "ghcr.io/cirruslabs/macos-sequoia-base:latest"
+  vm_name      = "my-custom-sequoia"
   cpu_count    = 4
   memory_gb    = 8
   disk_size_gb = 70

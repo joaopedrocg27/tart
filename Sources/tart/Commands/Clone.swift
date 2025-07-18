@@ -9,12 +9,10 @@ struct Clone: AsyncParsableCommand {
     Creates a local virtual machine by cloning either a remote or another local virtual machine.
 
     Due to copy-on-write magic in Apple File System, a cloned VM won't actually claim all the space right away.
-    Only changes to a cloned disk will be written and claim new space. By default, Tart checks available capacity
-    in Tart's home directory and checks if there is enough space for the worst possible scenario: when the whole disk
-    will be modified.
+    Only changes to a cloned disk will be written and claim new space. This also speeds up clones enormously.
 
-    This behaviour can be disabled by setting TART_NO_AUTO_PRUNE environment variable. This might be helpful
-    for use cases when the original image is very big and a workload is known to only modify a fraction of the cloned disk.
+    By default, Tart checks available capacity in Tart's home directory and tries to reclaim minimum possible storage for the cloned image
+    to fit. This behaviour is called "automatic pruning" and can be disabled by setting TART_NO_AUTO_PRUNE environment variable.
     """
   )
 
@@ -29,6 +27,9 @@ struct Clone: AsyncParsableCommand {
 
   @Option(help: "network concurrency to use when pulling a remote VM from the OCI-compatible registry")
   var concurrency: UInt = 4
+
+  @Flag(help: .hidden)
+  var deduplicate: Bool = false
 
   func validate() throws {
     if newName.contains("/") {
@@ -47,7 +48,7 @@ struct Clone: AsyncParsableCommand {
     if let remoteName = try? RemoteName(sourceName), !ociStorage.exists(remoteName) {
       // Pull the VM in case it's OCI-based and doesn't exist locally yet
       let registry = try Registry(host: remoteName.host, namespace: remoteName.namespace, insecure: insecure)
-      try await ociStorage.pull(remoteName, registry: registry, concurrency: concurrency)
+      try await ociStorage.pull(remoteName, registry: registry, concurrency: concurrency, deduplicate: deduplicate)
     }
 
     let sourceVM = try VMStorageHelper.open(sourceName)
@@ -70,10 +71,14 @@ struct Clone: AsyncParsableCommand {
 
       try lock.unlock()
 
-      // APFS is doing copy-on-write so the above cloning operation (just copying files on disk)
+      // APFS is doing copy-on-write, so the above cloning operation (just copying files on disk)
       // is not actually claiming new space until the VM is started and it writes something to disk.
-      // So once we clone the VM let's try to claim a little bit of space for the VM to run.
-      try Prune.reclaimIfNeeded(UInt64(sourceVM.allocatedSizeBytes()), sourceVM)
+      //
+      // So, once we clone the VM let's try to claim the rest of space for the VM to run without errors.
+      let unallocatedBytes = try sourceVM.sizeBytes() - sourceVM.allocatedSizeBytes()
+      if unallocatedBytes > 0 {
+        try Prune.reclaimIfNeeded(UInt64(unallocatedBytes), sourceVM)
+      }
     }, onCancel: {
       try? FileManager.default.removeItem(at: tmpVMDir.baseURL)
     })

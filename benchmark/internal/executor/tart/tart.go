@@ -7,14 +7,17 @@ import (
 	"fmt"
 	"github.com/avast/retry-go/v4"
 	"github.com/google/uuid"
+	"github.com/shirou/gopsutil/mem"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapio"
 	"golang.org/x/crypto/ssh"
+	"io"
 	"net"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
-
-const baseImage = "ghcr.io/cirruslabs/macos-sonoma-base:latest"
 
 type Tart struct {
 	vmRunCancel context.CancelFunc
@@ -23,17 +26,34 @@ type Tart struct {
 	logger      *zap.Logger
 }
 
-func New(ctx context.Context, logger *zap.Logger) (*Tart, error) {
+func New(ctx context.Context, image string, runArgsExtra []string, logger *zap.Logger) (*Tart, error) {
 	tart := &Tart{
 		vmName: fmt.Sprintf("tart-benchmark-%s", uuid.NewString()),
 		logger: logger,
 	}
 
-	if err := Cmd(ctx, tart.logger, "pull", baseImage); err != nil {
+	if err := Cmd(ctx, tart.logger, "pull", image); err != nil {
 		return nil, err
 	}
 
-	if err := Cmd(ctx, tart.logger, "clone", baseImage, tart.vmName); err != nil {
+	if err := Cmd(ctx, tart.logger, "clone", image, tart.vmName); err != nil {
+		return nil, err
+	}
+
+	vmStat, err := mem.VirtualMemory()
+	if err != nil {
+		return nil, err
+	}
+
+	cpus := strconv.Itoa(runtime.NumCPU())
+	memory := strconv.FormatUint(vmStat.Total/1024/1024, 10)
+	logger.Info("Setting resources", zap.String("cpus", cpus), zap.String("memory", memory))
+	setResourcesArguments := []string{
+		"set", tart.vmName,
+		"--cpu", cpus,
+		"--memory", memory,
+	}
+	if err := Cmd(ctx, tart.logger, setResourcesArguments...); err != nil {
 		return nil, err
 	}
 
@@ -41,7 +61,11 @@ func New(ctx context.Context, logger *zap.Logger) (*Tart, error) {
 	tart.vmRunCancel = vmRunCancel
 
 	go func() {
-		_ = Cmd(vmRunCtx, tart.logger, "run", "--no-graphics", tart.vmName)
+		runArgs := []string{"run", "--no-graphics", tart.vmName}
+
+		runArgs = append(runArgs, runArgsExtra...)
+
+		_ = Cmd(vmRunCtx, tart.logger, runArgs...)
 	}()
 
 	ip, err := CmdWithOutput(ctx, tart.logger, "ip", "--wait", "60", tart.vmName)
@@ -105,10 +129,12 @@ func (tart *Tart) Run(ctx context.Context, command string) ([]byte, error) {
 	}()
 	defer monitorCancel()
 
+	loggerWriter := &zapio.Writer{Log: tart.logger, Level: zap.DebugLevel}
 	stdoutBuf := &bytes.Buffer{}
 
 	sshSession.Stdin = bytes.NewBufferString(command)
-	sshSession.Stdout = stdoutBuf
+	sshSession.Stdout = io.MultiWriter(stdoutBuf, loggerWriter)
+	sshSession.Stderr = loggerWriter
 
 	if err := sshSession.Shell(); err != nil {
 		return nil, err

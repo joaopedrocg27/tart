@@ -1,6 +1,5 @@
 import Foundation
 import Algorithms
-import AsyncAlgorithms
 
 enum RegistryError: Error {
   case UnexpectedHTTPStatusCode(when: String, code: Int, details: String = "")
@@ -10,6 +9,7 @@ enum RegistryError: Error {
 }
 
 enum HTTPMethod: String {
+  case HEAD = "HEAD"
   case GET = "GET"
   case POST = "POST"
   case PUT = "PUT"
@@ -20,21 +20,35 @@ enum HTTPCode: Int {
   case Ok = 200
   case Created = 201
   case Accepted = 202
+  case PartialContent = 206
   case Unauthorized = 401
+  case NotFound = 404
 }
 
 extension Data {
   func asText() -> String {
     String(decoding: self, as: UTF8.self)
   }
+
+  func asTextPreview(limit: Int = 1000) -> String {
+    guard count > limit else {
+      return asText()
+    }
+
+    return "\(asText().prefix(limit))..."
+  }
 }
 
-extension AsyncThrowingChannel<Data, Error> {
-  func asData() async throws -> Data {
+extension AsyncThrowingStream<Data, Error> {
+  func asData(limitBytes: Int64? = nil) async throws -> Data {
     var result = Data()
 
     for try await chunk in self {
       result += chunk
+
+      if let limitBytes, result.count > limitBytes {
+        return result
+      }
     }
 
     return result
@@ -112,11 +126,11 @@ class Registry {
     return host
   }
 
-  init(urlComponents: URLComponents,
+  init(baseURL: URL,
        namespace: String,
        credentialsProviders: [CredentialsProvider] = [EnvironmentCredentialsProvider(), DockerConfigCredentialsProvider(), KeychainCredentialsProvider()]
   ) throws {
-    baseURL = urlComponents.url!
+    self.baseURL = baseURL
     self.namespace = namespace
     self.credentialsProviders = credentialsProviders
   }
@@ -130,7 +144,17 @@ class Registry {
     let proto = insecure ? "http" : "https"
     let baseURLComponents = URLComponents(string: proto + "://" + host + "/v2/")!
 
-    try self.init(urlComponents: baseURLComponents, namespace: namespace, credentialsProviders: credentialsProviders)
+    guard let baseURL = baseURLComponents.url else {
+      var hint = ""
+
+      if host.hasPrefix("http://") || host.hasPrefix("https://") {
+        hint += ", make sure that it doesn't start with http:// or https://"
+      }
+
+      throw RuntimeError.ImproperlyFormattedHost(host, hint)
+    }
+
+    try self.init(baseURL: baseURL, namespace: namespace, credentialsProviders: credentialsProviders)
   }
 
   func ping() async throws {
@@ -148,7 +172,7 @@ class Registry {
                                                  body: manifestJSON)
     if response.statusCode != HTTPCode.Created.rawValue {
       throw RegistryError.UnexpectedHTTPStatusCode(when: "pushing manifest", code: response.statusCode,
-                                                   details: data.asText())
+                                                   details: data.asTextPreview())
     }
 
     return Digest.hash(manifestJSON)
@@ -159,7 +183,7 @@ class Registry {
                                                  headers: ["Accept": ociManifestMediaType])
     if response.statusCode != HTTPCode.Ok.rawValue {
       throw RegistryError.UnexpectedHTTPStatusCode(when: "pulling manifest", code: response.statusCode,
-                                                   details: data.asText())
+                                                   details: data.asTextPreview())
     }
 
     let manifest = try OCIManifest(fromJSON: data)
@@ -179,19 +203,19 @@ class Registry {
     return URLComponents(url: uploadLocation.absolutize(baseURL), resolvingAgainstBaseURL: true)!
   }
 
-  public func pushBlob(fromData: Data, chunkSizeMb: Int = 0) async throws -> String {
+  public func pushBlob(fromData: Data, chunkSizeMb: Int = 0, digest: String? = nil) async throws -> String {
     // Initiate a blob upload
     let (data, postResponse) = try await dataRequest(.POST, endpointURL("\(namespace)/blobs/uploads/"),
                                                      headers: ["Content-Length": "0"])
     if postResponse.statusCode != HTTPCode.Accepted.rawValue {
       throw RegistryError.UnexpectedHTTPStatusCode(when: "pushing blob (POST)", code: postResponse.statusCode,
-                                                   details: data.asText())
+                                                   details: data.asTextPreview())
     }
 
     // Figure out where to upload the blob
     var uploadLocation = try uploadLocationFromResponse(postResponse)
 
-    let digest = Digest.hash(fromData)
+    let digest = digest ?? Digest.hash(fromData)
 
     if chunkSizeMb == 0 {
       // monolithic upload
@@ -206,7 +230,7 @@ class Registry {
       )
       if response.statusCode != HTTPCode.Created.rawValue {
         throw RegistryError.UnexpectedHTTPStatusCode(when: "pushing blob (PUT) to \(uploadLocation)",
-                                                     code: response.statusCode, details: data.asText())
+                                                     code: response.statusCode, details: data.asTextPreview())
       }
       return digest
     }
@@ -229,7 +253,7 @@ class Registry {
       // always accept both statuses since AWS ECR is not following specification
       if response.statusCode != HTTPCode.Created.rawValue && response.statusCode != HTTPCode.Accepted.rawValue {
         throw RegistryError.UnexpectedHTTPStatusCode(when: "streaming blob to \(uploadLocation)",
-                                                     code: response.statusCode, details: data.asText())
+                                                     code: response.statusCode, details: data.asTextPreview())
       }
       uploadedBytes += chunk.count
       // Update location for the next chunk
@@ -239,10 +263,35 @@ class Registry {
     return digest
   }
 
-  public func pullBlob(_ digest: String, handler: (Data) async throws -> Void) async throws {
-    let (channel, response) = try await channelRequest(.GET, endpointURL("\(namespace)/blobs/\(digest)"), viaFile: true)
-    if response.statusCode != HTTPCode.Ok.rawValue {
-      let body = try await channel.asData().asText()
+  public func blobExists(_ digest: String) async throws -> Bool {
+    let (data, response) = try await dataRequest(.HEAD, endpointURL("\(namespace)/blobs/\(digest)"))
+
+    switch response.statusCode {
+    case HTTPCode.Ok.rawValue:
+      return true
+    case HTTPCode.NotFound.rawValue:
+      return false
+    default:
+      throw RegistryError.UnexpectedHTTPStatusCode(when: "checking blob", code: response.statusCode, details: data.asTextPreview())
+    }
+  }
+
+  public func pullBlob(_ digest: String, rangeStart: Int64 = 0, handler: (Data) async throws -> Void) async throws {
+    var expectedStatusCode = HTTPCode.Ok
+    var headers: [String: String] = [:]
+
+    // Send Range header and expect HTTP 206 in return
+    //
+    // However, do not send Range header at all when rangeStart is 0,
+    // because it makes no sense and we might get HTTP 200 in return
+    if rangeStart != 0 {
+      expectedStatusCode = HTTPCode.PartialContent
+      headers["Range"] = "bytes=\(rangeStart)-"
+    }
+
+    let (channel, response) = try await channelRequest(.GET, endpointURL("\(namespace)/blobs/\(digest)"), headers: headers, viaFile: true)
+    if response.statusCode != expectedStatusCode.rawValue {
+      let body = try await channel.asData(limitBytes: 4096).asTextPreview()
       throw RegistryError.UnexpectedHTTPStatusCode(when: "pulling blob", code: response.statusCode,
                                                    details: body)
     }
@@ -282,7 +331,7 @@ class Registry {
     body: Data? = nil,
     doAuth: Bool = true,
     viaFile: Bool = false
-  ) async throws -> (AsyncThrowingChannel<Data, Error>, HTTPURLResponse) {
+  ) async throws -> (AsyncThrowingStream<Data, Error>, HTTPURLResponse) {
     var urlComponents = urlComponents
 
     if urlComponents.queryItems == nil && !parameters.isEmpty {
@@ -302,12 +351,11 @@ class Registry {
       request.httpBody = body
     }
 
-    var (channel, response) = try await authAwareRequest(request: request, viaFile: viaFile)
+    var (channel, response) = try await authAwareRequest(request: request, viaFile: viaFile, doAuth: doAuth)
 
     if doAuth && response.statusCode == HTTPCode.Unauthorized.rawValue {
-      _ = try await channel.asData()
       try await auth(response: response)
-      (channel, response) = try await authAwareRequest(request: request, viaFile: viaFile)
+      (channel, response) = try await authAwareRequest(request: request, viaFile: viaFile, doAuth: doAuth)
     }
 
     return (channel, response)
@@ -367,7 +415,7 @@ class Registry {
     let (data, response) = try await dataRequest(.GET, authenticateURL, headers: headers, doAuth: false)
     if response.statusCode != HTTPCode.Ok.rawValue {
       throw RegistryError.AuthFailed(why: "received unexpected HTTP status code \(response.statusCode) "
-        + "while retrieving an authentication token", details: data.asText())
+        + "while retrieving an authentication token", details: data.asTextPreview())
     }
 
     await authenticationKeeper.set(try TokenResponse.parse(fromData: data))
@@ -388,11 +436,13 @@ class Registry {
     return nil
   }
 
-  private func authAwareRequest(request: URLRequest, viaFile: Bool = false) async throws -> (AsyncThrowingChannel<Data, Error>, HTTPURLResponse) {
+  private func authAwareRequest(request: URLRequest, viaFile: Bool = false, doAuth: Bool) async throws -> (AsyncThrowingStream<Data, Error>, HTTPURLResponse) {
     var request = request
 
-    if let (name, value) = await authenticationKeeper.header() {
-      request.addValue(value, forHTTPHeaderField: name)
+    if doAuth {
+      if let (name, value) = await authenticationKeeper.header() {
+        request.addValue(value, forHTTPHeaderField: name)
+      }
     }
 
     request.setValue("Tart/\(CI.version) (\(DeviceInfo.os); \(DeviceInfo.model))",

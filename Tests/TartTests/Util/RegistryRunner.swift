@@ -31,7 +31,7 @@ class RegistryRunner {
 
   init() async throws {
     // Start container
-    let container = try Self.dockerCmd("run", "-d", "--rm", "-p", "5000", "registry:2")
+    let container = try Self.dockerCmd("run", "-d", "--rm", "-p", "127.0.0.1:0:5000", "registry:2")
       .trimmingCharacters(in: CharacterSet.newlines)
     containerID = container
 
@@ -39,7 +39,7 @@ class RegistryRunner {
     let port = try Self.dockerCmd("inspect", containerID, "--format", "{{(index (index .NetworkSettings.Ports \"5000/tcp\") 0).HostPort}}")
       .trimmingCharacters(in: CharacterSet.newlines)
 
-    registry = try Registry(urlComponents: URLComponents(string: "http://127.0.0.1:\(port)/v2/")!,
+    registry = try Registry(baseURL: URL(string: "http://127.0.0.1:\(port)/v2/")!,
                             namespace: "vm-image")
 
     // Wait for the Docker Registry to start

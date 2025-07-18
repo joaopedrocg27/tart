@@ -24,6 +24,8 @@ class VMStorageHelper {
   private static func missingVMWrap<R: Any>(_ name: String, closure: () throws -> R) throws -> R {
     do {
       return try closure()
+    } catch RuntimeError.PIDLockMissing {
+      throw RuntimeError.VMDoesNotExist(name: name)
     } catch {
       if error.isFileNotFound() {
         throw RuntimeError.VMDoesNotExist(name: name)
@@ -47,6 +49,7 @@ extension Error {
 }
 
 enum RuntimeError : Error {
+  case Generic(_ message: String)
   case VMConfigurationError(_ message: String)
   case VMDoesNotExist(name: String)
   case VMMissingFiles(_ message: String)
@@ -57,10 +60,14 @@ enum RuntimeError : Error {
   case DiskAlreadyInUse(_ message: String)
   case FailedToOpenBlockDevice(_ path: String, _ explanation: String)
   case InvalidDiskSize(_ message: String)
+  case FailedToCreateDisk(_ message: String)
+  case FailedToResizeDisk(_ message: String)
   case FailedToUpdateAccessDate(_ message: String)
   case PIDLockFailed(_ message: String)
+  case PIDLockMissing(_ message: String)
   case FailedToParseRemoteName(_ message: String)
   case VMTerminationFailed(_ message: String)
+  case ImproperlyFormattedHost(_ host: String, _ hint: String)
   case InvalidCredentials(_ message: String)
   case VMDirectoryAlreadyInitialized(_ message: String)
   case ExportFailed(_ message: String)
@@ -70,6 +77,9 @@ enum RuntimeError : Error {
   case OCIUnsupportedDiskFormat(_ format: String)
   case SuspendFailed(_ message: String)
   case PullFailed(_ message: String)
+  case VirtualMachineLimitExceeded(_ hint: String)
+  case VMSocketFailed(_ port: UInt32, _ explanation: String)
+  case TerminalOperationFailed(_ message: String)
 }
 
 protocol HasExitCode {
@@ -79,6 +89,8 @@ protocol HasExitCode {
 extension RuntimeError : CustomStringConvertible {
   public var description: String {
     switch self {
+    case .Generic(let message):
+      return message
     case .VMConfigurationError(let message):
       return message
     case .VMDoesNotExist(let name):
@@ -99,14 +111,22 @@ extension RuntimeError : CustomStringConvertible {
       return "failed to open block device \(path): \(explanation)"
     case .InvalidDiskSize(let message):
       return message
+    case .FailedToCreateDisk(let message):
+      return message
+    case .FailedToResizeDisk(let message):
+      return message
     case .FailedToUpdateAccessDate(let message):
       return message
     case .PIDLockFailed(let message):
+      return message
+    case .PIDLockMissing(let message):
       return message
     case .FailedToParseRemoteName(let cause):
       return "failed to parse remote name: \(cause)"
     case .VMTerminationFailed(let message):
       return message
+    case .ImproperlyFormattedHost(let host, let hint):
+      return "improperly formatted host \"\(host)\" was provided\(hint)"
     case .InvalidCredentials(let message):
       return message
     case .VMDirectoryAlreadyInitialized(let message):
@@ -124,6 +144,12 @@ extension RuntimeError : CustomStringConvertible {
     case .SuspendFailed(let message):
       return "Failed to suspend the VM: \(message)"
     case .PullFailed(let message):
+      return message
+    case .VirtualMachineLimitExceeded(let hint):
+      return "The number of VMs exceeds the system limit\(hint)"
+    case .VMSocketFailed(let port, let explanation):
+      return "Failed to establish a VM socket connection to port \(port): \(explanation)"
+    case .TerminalOperationFailed(let message):
       return message
     }
   }

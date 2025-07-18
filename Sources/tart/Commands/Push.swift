@@ -15,6 +15,9 @@ struct Push: AsyncParsableCommand {
   @Flag(help: "connect to the OCI registry via insecure HTTP protocol")
   var insecure: Bool = false
 
+  @Option(help: "network concurrency to use when pushing a local VM to the OCI-compatible registry")
+  var concurrency: UInt = 4
+
   @Option(help: ArgumentHelp("chunk size in MB if registry supports chunked uploads",
                              discussion: """
                              By default monolithic method is used for uploading blobs to the registry but some registries support a more efficient chunked method.
@@ -22,6 +25,11 @@ struct Push: AsyncParsableCommand {
                              Please refer to the documentation of your particular registry in order to see if this option is suitable for you and what's the recommended chunk size.
                              """))
   var chunkSize: Int = 0
+
+
+  @Option(name: [.customLong("label")], help: ArgumentHelp("additional metadata to attach to the OCI image configuration in key=value format",
+                                                           discussion: "Can be specified multiple times to attach multiple labels."))
+  var labels: [String] = []
 
   @Option(help: .hidden)
   var diskFormat: String = "v2"
@@ -33,6 +41,10 @@ struct Push: AsyncParsableCommand {
   func run() async throws {
     let ociStorage = VMStorageOCI()
     let localVMDir = try VMStorageHelper.open(localName)
+    let lock = try localVMDir.lock()
+    if try !lock.trylock() {
+      throw RuntimeError.VMIsRunning(localName)
+    }
 
     // Parse remote names supplied by the user
     let remoteNames = try remoteNames.map{
@@ -73,7 +85,9 @@ struct Push: AsyncParsableCommand {
           registry: registry,
           references: references,
           chunkSizeMb: chunkSize,
-          diskFormat: diskFormat
+          diskFormat: diskFormat,
+          concurrency: concurrency,
+          labels: parseLabels()
         )
         // Populate the local cache (if requested)
         if populateCache {
@@ -107,6 +121,28 @@ struct Push: AsyncParsableCommand {
     return RemoteName(host: registry.host!, namespace: registry.namespace,
                       reference: Reference(digest: digest))
   }
+
+  // Helper method to convert labels array to dictionary
+  func parseLabels() -> [String: String] {
+    var result = [String: String]()
+
+    for label in labels {
+      let parts = label.trimmingCharacters(in: .whitespaces).split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+
+      let key = parts.count > 0 ? String(parts[0]) : ""
+      let value = parts.count > 1 ? String(parts[1]) : ""
+
+      // It sometimes makes sense to provide an empty value,
+      // but not an empty key
+      if key.isEmpty {
+        continue
+      }
+
+      result[key] = value
+    }
+
+    return result
+  }  
 }
 
 extension Collection where Element == RemoteName {

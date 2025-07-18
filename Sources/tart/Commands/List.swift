@@ -7,6 +7,7 @@ fileprivate struct VMInfo: Encodable {
   let Name: String
   let Disk: Int
   let Size: Int
+  let SizeOnDisk: Int
   let Running: Bool
   let State: String
 }
@@ -17,7 +18,7 @@ struct List: AsyncParsableCommand {
   @Option(help: ArgumentHelp("Only display VMs from the specified source (e.g. --source local, --source oci)."))
   var source: String?
 
-  @Option(help: "Output format: text or json")
+  @Option(help: "Output format: text or json", completion: .list(["text", "json"]))
   var format: Format = .text
 
   @Flag(name: [.short, .long], help: ArgumentHelp("Only display VM names."))
@@ -38,13 +39,13 @@ struct List: AsyncParsableCommand {
 
     if source == nil || source == "local" {
       infos += sortedInfos(try VMStorageLocal().list().map { (name, vmDir) in
-        try VMInfo(Source: "local", Name: name, Disk: vmDir.sizeGB(), Size: vmDir.allocatedSizeGB(), Running: vmDir.running(), State: vmDir.state().rawValue)
+        try VMInfo(Source: "local", Name: name, Disk: vmDir.sizeGB(), Size: vmDir.allocatedSizeGB(), SizeOnDisk: vmDir.allocatedSizeGB() - vmDir.deduplicatedSizeGB(), Running: vmDir.running(), State: vmDir.state().rawValue)
       })
     }
 
     if source == nil || source == "oci" {
       infos += sortedInfos(try VMStorageOCI().list().map { (name, vmDir, _) in
-        try VMInfo(Source: "OCI", Name: name, Disk: vmDir.sizeGB(), Size: vmDir.allocatedSizeGB(), Running: vmDir.running(), State: vmDir.state().rawValue)
+        try VMInfo(Source: "OCI", Name: name, Disk: vmDir.sizeGB(), Size: vmDir.allocatedSizeGB(), SizeOnDisk: vmDir.allocatedSizeGB() - vmDir.deduplicatedSizeGB(), Running: vmDir.running(), State: vmDir.state().rawValue)
       })
     }
 

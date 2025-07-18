@@ -5,7 +5,7 @@ class DiskV1: Disk {
   private static let bufferSizeBytes = 4 * 1024 * 1024
   private static let layerLimitBytes = 500 * 1000 * 1000
 
-  static func push(diskURL: URL, registry: Registry, chunkSizeMb: Int, progress: Progress) async throws -> [OCIManifestLayer] {
+  static func push(diskURL: URL, registry: Registry, chunkSizeMb: Int, concurrency: UInt, progress: Progress) async throws -> [OCIManifestLayer] {
     var pushedLayers: [OCIManifestLayer] = []
 
     // Open the disk file
@@ -45,7 +45,7 @@ class DiskV1: Disk {
     return pushedLayers
   }
 
-  static func pull(registry: Registry, diskLayers: [OCIManifestLayer], diskURL: URL, concurrency: UInt, progress: Progress, localLayerCache: LocalLayerCache? = nil) async throws {
+  static func pull(registry: Registry, diskLayers: [OCIManifestLayer], diskURL: URL, concurrency: UInt, progress: Progress, localLayerCache: LocalLayerCache? = nil, deduplicate: Bool = false) async throws {
     if !FileManager.default.createFile(atPath: diskURL.path, contents: nil) {
       throw OCIError.FailedToCreateVmFile
     }
@@ -57,7 +57,7 @@ class DiskV1: Disk {
     // Decompress the layers onto the disk in a single stream
     let filter = try OutputFilter(.decompress, using: .lz4, bufferCapacity: Self.bufferSizeBytes) { data in
       if let data = data {
-        disk.write(data)
+        try disk.write(contentsOf: data)
       }
     }
 

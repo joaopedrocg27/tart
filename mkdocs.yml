@@ -46,6 +46,7 @@ plugins:
       match_path: blog/posts/.*
       date_from_meta:
         as_creation: date
+      abstract_chars_count: -1
   - social:
       cards_layout_dir: docs/layouts
       cards_layout: custom
@@ -91,13 +92,20 @@ nav:
   - "Home": index.md
   - "Quick Start": quick-start.md
   - "Integrations":
-    - "Self-hosted CI": integrations/cirrus-cli.md
-    - "GitHub Actions": https://cirrus-runners.app/
-    - "GitLab Runner": integrations/gitlab-runner.md
-    - "Buildkite": integrations/buildkite.md
-    - "Managing VMs": integrations/vm-management.md
+      - "Self-hosted CI": integrations/cirrus-cli.md
+      - "GitHub Actions": https://cirrus-runners.app/
+      - "GitLab Runner": integrations/gitlab-runner.md
+      - "Buildkite": integrations/buildkite.md
+      - "Managing VMs": integrations/vm-management.md
   - "Support & Licensing": licensing.md
-  - "Orchestration": https://github.com/cirruslabs/orchard
+  - "Orchestration":
+      - "Quick Start": orchard/quick-start.md
+      - "Architecture and Security": orchard/architecture-and-security.md
+      - "Deploying Controller": orchard/deploying-controller.md
+      - "Deploying Workers": orchard/deploying-workers.md
+      - "Using Orchard CLI": orchard/using-orchard-cli.md
+      - "Managing the Cluster": orchard/managing-cluster.md
+      - "Integrating with the API": orchard/integration-guide.md
   - "FAQ": faq.md
   - "Legal":
       - 'Terms of Service': legal/terms.md

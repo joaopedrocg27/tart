@@ -12,6 +12,56 @@ var vm: VM?
 struct IPNotFound: Error {
 }
 
+@available(macOS 14, *)
+extension VZDiskSynchronizationMode {
+  public init(_ description: String) throws {
+    switch description {
+    case "none":
+      self = .none
+    case "full":
+      self = .full
+    case "":
+      self = .full
+    default:
+      throw RuntimeError.VMConfigurationError("unsupported disk synchronization mode: \"\(description)\"")
+    }
+  }
+}
+
+extension VZDiskImageSynchronizationMode {
+  public init(_ description: String) throws {
+    switch description {
+    case "none":
+      self = .none
+    case "fsync":
+      self = .fsync
+    case "full":
+      self = .full
+    case "":
+      self = .full
+    default:
+      throw RuntimeError.VMConfigurationError("unsupported disk image synchronization mode: \"\(description)\"")
+    }
+  }
+}
+
+extension VZDiskImageCachingMode {
+  public init?(_ description: String) throws {
+    switch description {
+    case "automatic":
+      self = .automatic
+    case "cached":
+      self = .cached
+    case "uncached":
+      self = .uncached
+    case "":
+      return nil
+    default:
+      throw RuntimeError.VMConfigurationError("unsupported disk image caching mode: \"\(description)\"")
+    }
+  }
+}
+
 struct Run: AsyncParsableCommand {
   static var configuration = CommandConfiguration(abstract: "Run a VM")
 
@@ -31,7 +81,7 @@ struct Run: AsyncParsableCommand {
   @Option(help: ArgumentHelp(
     "Attach an externally created serial console",
     discussion: "Alternative to `--serial` flag for programmatic integrations."
-  ))
+  ), completion: .file())
   var serialPath: String?
 
   @Flag(help: ArgumentHelp("Force open a UI window, even when VNC is enabled.", visibility: .private))
@@ -42,7 +92,7 @@ struct Run: AsyncParsableCommand {
 
   @Flag(help: ArgumentHelp(
     "Disable clipboard sharing between host and guest.",
-    discussion: "Only works with Linux-based guest operating systems."))
+    discussion: "Clipboard sharing requires spice-vdagent package on Linux and https://github.com/cirruslabs/tart-guest-agent on macOS."))
   var noClipboard: Bool = false
 
   #if arch(arm64)
@@ -67,7 +117,7 @@ struct Run: AsyncParsableCommand {
   var vncExperimental: Bool = false
 
   @Option(help: ArgumentHelp("""
-  Additional disk attachments with an optional read-only specifier\n(e.g. --disk=\"disk.bin\" --disk=\"ubuntu.iso:ro\" --disk=\"/dev/disk0\" --disk "ghcr.io/cirruslabs/xcode:16.0:ro" --disk=\"nbd://localhost:10809/myDisk\")
+  Additional disk attachments with an optional read-only and synchronization options in the form of path[:options] (e.g. --disk="disk.bin", --disk="ubuntu.iso:ro", --disk="/dev/disk0", --disk "ghcr.io/cirruslabs/xcode:16.0:ro" or --disk="nbd://localhost:10809/myDisk:sync=none")
   """, discussion: """
   The disk attachment can be a:
 
@@ -76,14 +126,20 @@ struct Run: AsyncParsableCommand {
   * remote VM name whose disk will be mounted
   * Network Block Device (NBD) URL
 
+  Options are comma-separated and are as follows:
+
+  * ro — attach the specified disk in read-only mode instead of the default read-write (e.g. --disk="disk.img:ro")
+
+  * sync=none — disable data synchronization with the permanent storage to increase performance at the cost of a higher chance of data loss (e.g. --disk="disk.img:sync=none")
+
   Learn how to create a disk image using Disk Utility here: https://support.apple.com/en-gb/guide/disk-utility/dskutl11888/mac
 
   To work with block devices, the easiest way is to modify their permissions (e.g. by using "sudo chown $USER /dev/diskX") or to run the Tart binary as root, which affects locating Tart VMs.
 
   To work around this pass TART_HOME explicitly:
 
-  sudo TART_HOME="$HOME/.tart" tart run sonoma --disk=/dev/disk0
-  """, valueName: "path[:ro]"))
+  sudo TART_HOME="$HOME/.tart" tart run sequoia --disk=/dev/disk0
+  """, valueName: "path[:options]"), completion: .file())
   var disk: [String] = []
 
   #if arch(arm64)
@@ -102,7 +158,7 @@ struct Run: AsyncParsableCommand {
   #endif
   var rosettaTag: String?
 
-  @Option(help: ArgumentHelp("Additional directory shares with an optional read-only and mount tag options (e.g. --dir=\"~/src/build\" or --dir=\"~/src/sources:ro\")", discussion: """
+  @Option(help: ArgumentHelp("Additional directory shares with an optional read-only and mount tag options in the form of [name:]path[:options] (e.g. --dir=\"~/src/build\" or --dir=\"~/src/sources:ro\")", discussion: """
   Requires host to be macOS 13.0 (Ventura) or newer. macOS guests must be running macOS 13.0 (Ventura) or newer too.
 
   Options are comma-separated and are as follows:
@@ -114,8 +170,11 @@ struct Run: AsyncParsableCommand {
   Mount tag can be overridden by appending tag property to the directory share (e.g. --dir=\"~/src/build:tag=build\" or --dir=\"~/src/build:ro,tag=build\"). Then it can be mounted via "mount_virtiofs build ~/build" inside guest macOS and "mount -t virtiofs build ~/build" inside guest Linux.
 
   In case of passing multiple directories per mount tag it is required to prefix them with names e.g. --dir=\"build:~/src/build\" --dir=\"sources:~/src/sources:ro\". These names will be used as directory names under the mounting point inside guests. For the example above it will be "/Volumes/My Shared Files/build" and "/Volumes/My Shared Files/sources" respectively.
-  """, valueName: "[name:]path[:options]"))
+  """, valueName: "[name:]path[:options]"), completion: .directory)
   var dir: [String] = []
+
+  @Flag(help: ArgumentHelp("Enable nested virtualization if possible"))
+  var nested: Bool = false
 
   @Option(help: ArgumentHelp("""
   Use bridged networking instead of the default shared (NAT) networking \n(e.g. --net-bridged=en0 or --net-bridged=\"Wi-Fi\")
@@ -124,15 +183,71 @@ struct Run: AsyncParsableCommand {
   """, valueName: "interface name"))
   var netBridged: [String] = []
 
-  @Flag(help: ArgumentHelp("Use software networking instead of the default shared (NAT) networking",
-                           discussion: "Learn how to configure Softnet for use with Tart here: https://github.com/cirruslabs/softnet"))
+  @Flag(help: ArgumentHelp("Use software networking provided by Softnet instead of the default shared (NAT) networking",
+                           discussion: """
+                           Softnet provides better network isolation and alleviates DHCP shortage on production systems. Tart invokes Softnet when this option is specified as a sub-process and communicates with it over socketpair(2).
+
+                           It is essentially a userspace packet filter which restricts the VM networking and prevents a class of security issues, such as ARP spoofing. By default, the VM will only be able to:
+
+                           * send traffic from its own MAC-address
+                           * send traffic from the IP-address assigned to it by the DHCP
+                           * send traffic to globally routable IPv4 addresses
+                           * send traffic to gateway IP of the vmnet bridge (this would normally be \"bridge100\" interface)
+                           * receive any incoming traffic
+
+                           In addition, Softnet tunes macOS built-in DHCP server to decrease its lease time from the default 86,400 seconds (one day) to 600 seconds (10 minutes). This is especially important when you use Tart to clone and run a lot of ephemeral VMs over a period of one day.
+
+                           More on Softnet here: https://github.com/cirruslabs/softnet
+                           """))
   var netSoftnet: Bool = false
 
-  @Option(help: ArgumentHelp("Comma-separated list of CIDRs to allow the traffic to when using Softnet isolation\n(e.g. --net-softnet-allow=192.168.0.0/24)", valueName: "comma-separated CIDRs"))
+  @Option(help: ArgumentHelp("Comma-separated list of CIDRs to allow the traffic to when using Softnet isolation\n(e.g. --net-softnet-allow=192.168.0.0/24)", discussion: """
+  This option allows you bypass the private IPv4 address space restrictions imposed by --net-softnet.
+
+  For example, you can allow the VM to communicate with the local network with e.g. --net-softnet-allow=10.0.0.0/16 or to completely disable the destination based restrictions with --net-softnet-allow=0.0.0.0/0.
+
+  Implies --net-softnet.
+  """, valueName: "comma-separated CIDRs"))
   var netSoftnetAllow: String?
+
+  @Option(help: ArgumentHelp("Comma-separated list of TCP ports to expose (e.g. --net-softnet-expose 2222:22,8080:80)", discussion: """
+  Options are comma-separated and are as follows:
+
+  * EXTERNAL_PORT:INTERNAL_PORT — forward TCP traffic from the EXTERNAL_PORT on a host's egress interface (automatically detected and could be Wi-Fi, Ethernet and a VPN interface) to the INTERNAL_PORT on guest's IP (as reported by "tart ip")
+
+  Note that for the port forwarding to work correctly:
+
+  * the software in guest listening on INTERNAL_PORT should either listen on 0.0.0.0 or on an IP address assigned to that guest
+  * connection to the EXTERNAL_PORT should be performed from the local network that the host is attached to or from the internet, it's not possible to connect to that forwarded port from the host itself
+
+  Another thing to keep in mind is that regular Softnet restrictions will still apply even to port forwarding. So if you're planning to access your VM from local network, and your local network is 192.168.0.0/24, for example, then add --net-softnet-allow=192.168.0.0/24. If you only need port forwarding, to completely disable Softnet restrictions you can use --net-softnet-allow=0.0.0.0/0.
+
+  Implies --net-softnet.
+  """, valueName: "comma-separated port specifications"))
+  var netSoftnetExpose: String?
 
   @Flag(help: ArgumentHelp("Restrict network access to the host-only network"))
   var netHost: Bool = false
+
+  @Option(help: ArgumentHelp("Set the root disk options (e.g. --root-disk-opts=\"ro\" or --root-disk-opts=\"caching=cached,sync=none\")",
+                             discussion: """
+                             Options are comma-separated and are as follows:
+
+                             * ro — attach the root disk in read-only mode instead of the default read-write (e.g. --root-disk-opts="ro")
+
+                             * sync=none — disable data synchronization with the permanent storage to increase performance at the cost of a higher chance of data loss (e.g. --root-disk-opts="sync=none")
+
+                             * sync=fsync — enable data synchronization with the permanent storage, but don't ensure that it was actually written (e.g. --root-disk-opts="sync=fsync")
+
+                             * sync=full — enable data synchronization with the permanent storage and ensure that it was actually written (e.g. --root-disk-opts="sync=full")
+
+                             * caching=automatic — allows the virtualization framework to automatically determine whether to enable data caching
+
+                             * caching=cached — enabled data caching
+
+                             * caching=uncached — disables data caching
+                             """, valueName: "options"))
+  var rootDiskOpts: String = ""
 
   #if arch(arm64)
     @Flag(help: ArgumentHelp("Disables audio and entropy devices and switches to only Mac-specific input devices.", discussion: "Useful for running a VM that can be suspended via \"tart suspend\"."))
@@ -145,12 +260,22 @@ struct Run: AsyncParsableCommand {
   #endif
   var captureSystemKeys: Bool = false
 
+  #if arch(arm64)
+    @Flag(help: ArgumentHelp("Don't add trackpad as a pointing device on macOS VMs"))
+  #endif
+  var noTrackpad: Bool = false
+
   mutating func validate() throws {
     if vnc && vncExperimental {
       throw ValidationError("--vnc and --vnc-experimental are mutually exclusive")
     }
 
-    // check that not more than one network option is specified
+    // Automatically enable --net-softnet when any of its related options are specified
+    if netSoftnetAllow != nil || netSoftnetExpose != nil {
+      netSoftnet = true
+    }
+
+    // Check that no more than one network option is specified
     var netFlags = 0
     if netBridged.count > 0 { netFlags += 1 }
     if netSoftnet { netFlags += 1 }
@@ -168,6 +293,14 @@ struct Run: AsyncParsableCommand {
       throw ValidationError("--captures-system-keys can only be used with the default VM view")
     }
 
+    if nested {
+      if #unavailable(macOS 15) {
+        throw ValidationError("Nested virtualization is supported on hosts starting with macOS 15 (Sequoia), and later.")
+      } else if !VZGenericPlatformConfiguration.isNestedVirtualizationSupported {
+        throw ValidationError("Nested virtualization is available for Mac with the M3 chip, and later.")
+      }
+    }
+
     let localStorage = VMStorageLocal()
     let vmDir = try localStorage.open(name)
     if try vmDir.state() == .Suspended {
@@ -176,11 +309,19 @@ struct Run: AsyncParsableCommand {
 
     if suspendable {
       let config = try VMConfig.init(fromURL: vmDir.configURL)
-      if (config.platform is Linux) {
+      if !(config.platform is PlatformSuspendable) {
         throw ValidationError("You can only suspend macOS VMs")
       }
-      if dir.count > 0 {
-        throw ValidationError("Suspending VMs with shared directories is not supported")
+
+      if noTrackpad {
+        throw ValidationError("--no-trackpad cannot be used with --suspendable")
+      }
+    }
+
+    if noTrackpad {
+      let config = try VMConfig.init(fromURL: vmDir.configURL)
+      if config.os != .darwin {
+        throw ValidationError("--no-trackpad can only be used with macOS VMs")
       }
     }
 
@@ -195,6 +336,12 @@ struct Run: AsyncParsableCommand {
   func run() async throws {
     let localStorage = VMStorageLocal()
     let vmDir = try localStorage.open(name)
+
+    // Validate disk format support
+    let vmConfig = try VMConfig(fromURL: vmDir.configURL)
+    if !vmConfig.diskFormat.isSupported {
+      throw ValidationError("Disk format '\(vmConfig.diskFormat.rawValue)' is not supported on this system.")
+    }
 
     let storageLock = try FileLock(lockURL: Config().tartHomeDir)
     try storageLock.lock()
@@ -212,8 +359,6 @@ struct Run: AsyncParsableCommand {
     if (netSoftnet || netHost) && isInteractiveSession() {
       try Softnet.configureSUIDBitIfNeeded()
     }
-
-    let additionalDiskAttachments = try additionalDiskAttachments()
 
     var serialPorts: [VZSerialPortConfiguration] = []
     if serial {
@@ -233,15 +378,22 @@ struct Run: AsyncParsableCommand {
       serialPorts.append(createSerialPortConfiguration(tty_read!, tty_write!))
     }
 
+    // Parse root disk options
+    let diskOptions = DiskOptions(rootDiskOpts)
+
     vm = try VM(
       vmDir: vmDir,
       network: userSpecifiedNetwork(vmDir: vmDir) ?? NetworkShared(),
-      additionalStorageDevices: additionalDiskAttachments,
+      additionalStorageDevices: try additionalDiskAttachments(),
       directorySharingDevices: directoryShares() + rosettaDirectoryShare(),
       serialPorts: serialPorts,
       suspendable: suspendable,
+      nested: nested,
       audio: !noAudio,
-      clipboard: !noClipboard
+      clipboard: !noClipboard,
+      sync: VZDiskImageSynchronizationMode(diskOptions.syncModeRaw),
+      caching: VZDiskImageCachingMode(diskOptions.cachingModeRaw),
+      noTrackpad: noTrackpad
     )
 
     let vncImpl: VNC? = try {
@@ -291,7 +443,35 @@ struct Run: AsyncParsableCommand {
           }
         #endif
 
-        try await vm!.start(recovery: recovery, resume: resume)
+        do {
+          try await vm!.start(recovery: recovery, resume: resume)
+        } catch let error as VZError {
+          if error.code == .virtualMachineLimitExceeded {
+            var hint = ""
+
+            do {
+              let runningVMs: [String] = try localStorage.list().compactMap { (name, vmDir) in
+                if try !vmDir.running() {
+                  return nil
+                }
+
+                return name
+              }
+
+              if !runningVMs.isEmpty {
+                let runningVMsJoined = runningVMs.joined(separator: ", ")
+
+                hint = " (other running VMs: \(runningVMsJoined))"
+              }
+            } catch {
+              // we can't provide any hint
+            }
+
+            throw RuntimeError.VirtualMachineLimitExceeded(hint)
+          }
+
+          throw error
+        }
 
         if let vncImpl = vncImpl {
           let vncURL = try await vncImpl.waitForURL(netBridged: !netBridged.isEmpty)
@@ -301,6 +481,12 @@ struct Run: AsyncParsableCommand {
           } else {
             print("Opening \(vncURL)...")
             NSWorkspace.shared.open(vncURL)
+          }
+        }
+
+        if #available(macOS 14, *) {
+          Task {
+            try await ControlSocket(vmDir.controlSocketURL).run()
           }
         }
 
@@ -377,8 +563,10 @@ struct Run: AsyncParsableCommand {
 
     let useVNCWithoutGraphics = (vnc || vncExperimental) && !graphics
     if noGraphics || useVNCWithoutGraphics {
-      // enter the main even loop, without bringing up any UI,
-      // and just wait for the VM to exit.
+      // Enter the main event loop without bringing up any UI,
+      // waiting for the VM to exit.
+      NSApplication.shared.setActivationPolicy(.prohibited)
+
       NSApplication.shared.run()
     } else {
       runUI(suspendable, captureSystemKeys)
@@ -404,6 +592,10 @@ struct Run: AsyncParsableCommand {
 
     if let netSoftnetAllow = netSoftnetAllow {
       softnetExtraArguments += ["--allow", netSoftnetAllow]
+    }
+
+    if let netSoftnetExpose = netSoftnetExpose {
+      softnetExtraArguments += ["--expose", netSoftnetExpose]
     }
 
     if netSoftnet {
@@ -449,90 +641,9 @@ struct Run: AsyncParsableCommand {
   }
 
   func additionalDiskAttachments() throws -> [VZStorageDeviceConfiguration] {
-    var result: [VZStorageDeviceConfiguration] = []
-    let readOnlySuffix = ":ro"
-    let expandedDiskPaths = disk.map { NSString(string:$0).expandingTildeInPath }
-
-    for rawDisk in expandedDiskPaths {
-      let diskReadOnly = rawDisk.hasSuffix(readOnlySuffix)
-      let diskPath = diskReadOnly ? String(rawDisk.prefix(rawDisk.count - readOnlySuffix.count)) : rawDisk
-
-      let diskURL = URL(string: diskPath)
-      if (["nbd", "nbds", "nbd+unix", "nbds+unix"].contains(diskURL?.scheme)) {
-        guard #available(macOS 14, *) else {
-          throw UnsupportedOSError("attaching Network Block Devices", "are")
-        }
-
-        let nbdAttachment = try VZNetworkBlockDeviceStorageDeviceAttachment(
-          url: diskURL!,
-          timeout: 30,
-          isForcedReadOnly: diskReadOnly,
-          synchronizationMode: VZDiskSynchronizationMode.none
-        )
-        result.append(VZVirtioBlockDeviceConfiguration(attachment: nbdAttachment))
-        continue
-      }
-
-      let diskFileURL = URL(fileURLWithPath: diskPath)
-
-      if pathHasMode(diskPath, mode: S_IFBLK) {
-        guard #available(macOS 14, *) else {
-          throw UnsupportedOSError("attaching block devices", "are")
-        }
-
-        let fd = open(diskPath, diskReadOnly ? O_RDONLY : O_RDWR)
-        if fd == -1 {
-          let details = Errno(rawValue: CInt(errno))
-
-          switch details.rawValue {
-          case EBUSY:
-            throw RuntimeError.FailedToOpenBlockDevice(diskFileURL.url.path, "already in use, try umounting it via \"diskutil unmountDisk\" (when the whole disk) or \"diskutil umount\" (when mounting a single partition)")
-          case EACCES:
-            throw RuntimeError.FailedToOpenBlockDevice(diskFileURL.url.path, "permission denied, consider changing the disk's owner using \"sudo chown $USER \(diskFileURL.url.path)\" or run Tart as a superuser (see --disk help for more details on how to do that correctly)")
-          default:
-            throw RuntimeError.FailedToOpenBlockDevice(diskFileURL.url.path, "\(details)")
-          }
-        }
-
-        let blockAttachment = try VZDiskBlockDeviceStorageDeviceAttachment(fileHandle: FileHandle(fileDescriptor: fd, closeOnDealloc: true),
-                                                                           readOnly: diskReadOnly, synchronizationMode: .full)
-        result.append(VZVirtioBlockDeviceConfiguration(attachment: blockAttachment))
-        continue
-      }
-
-      // Support remote VM names in --disk command-line argument
-      if let remoteName = try? RemoteName(diskPath) {
-        let vmDir = try VMStorageOCI().open(remoteName)
-
-        // Unfortunately, VZDiskImageStorageDeviceAttachment does not support
-        // FileHandle, so we can't easily clone the disk, open it and unlink(2)
-        // to simplify the garbage collection, so use an intermediate directory.
-        let clonedDiskURL = try Config().tartTmpDir.appendingPathComponent("run-disk-\(UUID().uuidString)")
-
-        try FileManager.default.copyItem(at: vmDir.diskURL, to: clonedDiskURL)
-
-        let lock = try FileLock(lockURL: clonedDiskURL)
-        try lock.lock()
-
-        let diskImageAttachment = try VZDiskImageStorageDeviceAttachment(url: clonedDiskURL, readOnly: diskReadOnly)
-        result.append(VZVirtioBlockDeviceConfiguration(attachment: diskImageAttachment))
-        continue
-      }
-
-      // Error out if the disk is locked by the host (e.g. it was mounted in Finder),
-      // see https://github.com/cirruslabs/tart/issues/323 for more details.
-      if try !diskReadOnly && !FileLock(lockURL: diskFileURL).trylock() {
-        throw RuntimeError.DiskAlreadyInUse("disk \(diskFileURL.url.path) seems to be already in use, unmount it first in Finder")
-      }
-
-      let diskImageAttachment = try VZDiskImageStorageDeviceAttachment(
-        url: diskFileURL,
-        readOnly: diskReadOnly
-      )
-      result.append(VZVirtioBlockDeviceConfiguration(attachment: diskImageAttachment))
+    try disk.map {
+      try AdditionalDisk(parseFrom: $0).configuration
     }
-
-    return result
   }
 
   func directoryShares() throws -> [VZDirectorySharingDeviceConfiguration] {
@@ -615,7 +726,7 @@ struct MainApp: App {
   static var suspendable: Bool = false
   static var capturesSystemKeys: Bool = false
 
-  @NSApplicationDelegateAdaptor private var appDelegate: MinimalMenuAppDelegate
+  @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
 
   var body: some Scene {
     WindowGroup(vm!.name) {
@@ -671,18 +782,7 @@ struct MainApp: App {
   }
 }
 
-// The only way to fully remove Edit menu item.
-class MinimalMenuAppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
-  let indexOfEditMenu = 2
-
-  func applicationDidFinishLaunching(_ : Notification) {
-    NSApplication.shared.mainMenu?.removeItem(at: indexOfEditMenu)
-
-    let nsApp = NSApplication.shared
-    nsApp.setActivationPolicy(.regular)
-    nsApp.activate(ignoringOtherApps: true)
-  }
-
+class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     if (kill(getpid(), MainApp.suspendable ? SIGUSR1 : SIGINT) == 0) {
       return .terminateLater
@@ -735,12 +835,12 @@ struct VMView: NSViewRepresentable {
 
     machineView.capturesSystemKeys = capturesSystemKeys
 
-    // Enable automatic display reconfiguration
-    // for guests that support it
+    // If not specified, enable automatic display
+    // reconfiguration for guests that support it
     //
     // This is disabled for Linux because of poor HiDPI
     // support, which manifests in fonts being too small
-    if #available(macOS 14.0, *), vm.config.os != .linux {
+    if #available(macOS 14.0, *), vm.config.displayRefit ?? (vm.config.os != .linux) {
       machineView.automaticallyReconfiguresDisplay = true
     }
 
@@ -749,6 +849,138 @@ struct VMView: NSViewRepresentable {
 
   func updateNSView(_ nsView: NSViewType, context: Context) {
     nsView.virtualMachine = vm.virtualMachine
+  }
+}
+
+struct AdditionalDisk {
+  let configuration: VZStorageDeviceConfiguration
+
+  init(parseFrom: String) throws {
+    let (diskPath, readOnly, syncModeRaw, cachingModeRaw) = Self.parseOptions(parseFrom)
+
+    self.configuration = try Self.craft(diskPath, readOnly: readOnly, syncModeRaw: syncModeRaw, cachingModeRaw: cachingModeRaw)
+  }
+
+  static func craft(_ diskPath: String, readOnly diskReadOnly: Bool, syncModeRaw: String, cachingModeRaw: String) throws -> VZStorageDeviceConfiguration {
+    let diskURL = URL(string: diskPath)
+
+    if (["nbd", "nbds", "nbd+unix", "nbds+unix"].contains(diskURL?.scheme)) {
+      guard #available(macOS 14, *) else {
+        throw UnsupportedOSError("attaching Network Block Devices", "are")
+      }
+
+      let nbdAttachment = try VZNetworkBlockDeviceStorageDeviceAttachment(
+        url: diskURL!,
+        timeout: 30,
+        isForcedReadOnly: diskReadOnly,
+        synchronizationMode: try VZDiskSynchronizationMode(syncModeRaw)
+      )
+
+      return VZVirtioBlockDeviceConfiguration(attachment: nbdAttachment)
+    }
+
+    // Expand the tilde (~) since at this point we're dealing with a local path,
+    // and "expandingTildeInPath" seems to corrupt the remote URLs like nbd://
+    let diskPath = NSString(string: diskPath).expandingTildeInPath
+
+    let diskFileURL = URL(fileURLWithPath: diskPath)
+
+    if pathHasMode(diskPath, mode: S_IFBLK) {
+      guard #available(macOS 14, *) else {
+        throw UnsupportedOSError("attaching block devices", "are")
+      }
+
+      let fd = open(diskPath, diskReadOnly ? O_RDONLY : O_RDWR)
+      if fd == -1 {
+        let details = Errno(rawValue: CInt(errno))
+
+        switch details.rawValue {
+        case EBUSY:
+          throw RuntimeError.FailedToOpenBlockDevice(diskFileURL.url.path, "already in use, try umounting it via \"diskutil unmountDisk\" (when the whole disk) or \"diskutil umount\" (when mounting a single partition)")
+        case EACCES:
+          throw RuntimeError.FailedToOpenBlockDevice(diskFileURL.url.path, "permission denied, consider changing the disk's owner using \"sudo chown $USER \(diskFileURL.url.path)\" or run Tart as a superuser (see --disk help for more details on how to do that correctly)")
+        default:
+          throw RuntimeError.FailedToOpenBlockDevice(diskFileURL.url.path, "\(details)")
+        }
+      }
+
+      let blockAttachment = try VZDiskBlockDeviceStorageDeviceAttachment(fileHandle: FileHandle(fileDescriptor: fd, closeOnDealloc: true),
+                                                                         readOnly: diskReadOnly, synchronizationMode: try VZDiskSynchronizationMode(syncModeRaw))
+
+      return VZVirtioBlockDeviceConfiguration(attachment: blockAttachment)
+    }
+
+    // Support remote VM names in --disk command-line argument
+    if let remoteName = try? RemoteName(diskPath) {
+      let vmDir = try VMStorageOCI().open(remoteName)
+
+      // Unfortunately, VZDiskImageStorageDeviceAttachment does not support
+      // FileHandle, so we can't easily clone the disk, open it and unlink(2)
+      // to simplify the garbage collection, so use an intermediate directory.
+      let clonedDiskURL = try Config().tartTmpDir.appendingPathComponent("run-disk-\(UUID().uuidString)")
+
+      try FileManager.default.copyItem(at: vmDir.diskURL, to: clonedDiskURL)
+
+      let lock = try FileLock(lockURL: clonedDiskURL)
+      try lock.lock()
+
+      let diskImageAttachment = try VZDiskImageStorageDeviceAttachment(url: clonedDiskURL, readOnly: diskReadOnly)
+
+      return VZVirtioBlockDeviceConfiguration(attachment: diskImageAttachment)
+    }
+
+    // Error out if the disk is locked by the host (e.g. it was mounted in Finder),
+    // see https://github.com/cirruslabs/tart/issues/323 for more details.
+    if try !diskReadOnly && !FileLock(lockURL: diskFileURL).trylock() {
+      throw RuntimeError.DiskAlreadyInUse("disk \(diskFileURL.url.path) seems to be already in use, unmount it first in Finder")
+    }
+
+    let diskImageAttachment = try VZDiskImageStorageDeviceAttachment(
+      url: diskFileURL,
+      readOnly: diskReadOnly,
+      cachingMode: try VZDiskImageCachingMode(cachingModeRaw) ?? .automatic,
+      synchronizationMode: try VZDiskImageSynchronizationMode(syncModeRaw)
+    )
+
+    return VZVirtioBlockDeviceConfiguration(attachment: diskImageAttachment)
+  }
+
+  static func parseOptions(_ parseFrom: String) -> (String, Bool, String, String) {
+    var arguments = parseFrom.split(separator: ":")
+
+    let options = DiskOptions(String(arguments.last!))
+    if options.foundAtLeastOneOption {
+      arguments.removeLast()
+    }
+
+    return (arguments.joined(separator: ":"), options.readOnly, options.syncModeRaw, options.cachingModeRaw)
+  }
+}
+
+struct DiskOptions {
+  var readOnly: Bool = false
+  var syncModeRaw: String = ""
+  var cachingModeRaw: String = ""
+  var foundAtLeastOneOption: Bool = false
+
+  init(_ parseFrom: String) {
+    let options = parseFrom.split(separator: ",")
+
+    for option in options {
+      switch true {
+      case option == "ro":
+        self.readOnly = true
+        self.foundAtLeastOneOption = true
+      case option.hasPrefix("sync="):
+        self.syncModeRaw = String(option.dropFirst("sync=".count))
+        self.foundAtLeastOneOption = true
+      case option.hasPrefix("caching="):
+        self.cachingModeRaw = String(option.dropFirst("caching=".count))
+        self.foundAtLeastOneOption = true
+      default:
+        continue
+      }
+    }
   }
 }
 
@@ -868,7 +1100,7 @@ struct DirectoryShare {
     process.standardInput = inPipe
     process.launch()
 
-    inPipe.fileHandleForWriting.write(response!.data)
+    try inPipe.fileHandleForWriting.write(contentsOf: response!.data)
     try inPipe.fileHandleForWriting.close()
     process.waitUntilExit()
 

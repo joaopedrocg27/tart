@@ -27,12 +27,12 @@ class VMStorageOCI: PrunableStorage {
     return digest
   }
 
-  func open(_ name: RemoteName) throws -> VMDirectory {
+  func open(_ name: RemoteName, _ accessDate: Date = Date()) throws -> VMDirectory {
     let vmDir = VMDirectory(baseURL: vmURL(name))
 
     try vmDir.validate(userFriendlyName: name.description)
 
-    try vmDir.baseURL.updateAccessDate()
+    try vmDir.baseURL.updateAccessDate(accessDate)
 
     return vmDir
   }
@@ -140,7 +140,7 @@ class VMStorageOCI: PrunableStorage {
     try list().filter { (_, _, isSymlink) in !isSymlink }.map { (_, vmDir, _) in vmDir }
   }
 
-  func pull(_ name: RemoteName, registry: Registry, concurrency: UInt) async throws {
+  func pull(_ name: RemoteName, registry: Registry, concurrency: UInt, deduplicate: Bool) async throws {
     SentrySDK.configureScope { scope in
       scope.setContext(value: ["imageName": name.description], key: "OCI")
     }
@@ -180,6 +180,10 @@ class VMStorageOCI: PrunableStorage {
       let transaction = SentrySDK.startTransaction(name: name.description, operation: "pull", bindToScope: true)
       let tmpVMDir = try VMDirectory.temporaryDeterministic(key: name.description)
 
+      // Open an existing VM directory corresponding to this name, if any,
+      // marking it as outdated to speed up the garbage collection process
+      _ = try? open(name, Date(timeIntervalSince1970: 0))
+
       // Lock the temporary VM directory to prevent it's garbage collection
       let tmpVMDirLock = try FileLock(lockURL: tmpVMDir.baseURL)
       try tmpVMDirLock.lock()
@@ -196,22 +200,29 @@ class VMStorageOCI: PrunableStorage {
       }
 
       try await withTaskCancellationHandler(operation: {
-        try await retry(maxAttempts: 5, backoff: .exponentialWithFullJitter(baseDelay: .seconds(5), maxDelay: .seconds(60))) {
-          var localLayerCache: LocalLayerCache? = nil
+        try await retry(maxAttempts: 5) {
+          // Choose the best base image which has the most deduplication ratio
+          let localLayerCache = try await chooseLocalLayerCache(name, manifest, registry)
 
-          if name.reference.type == .Tag,
-             let vmDir = try? open(name),
-             let digest = try? digest(name),
-             let (manifest, _) = try? await registry.pullManifest(reference: digest) {
-            localLayerCache = try LocalLayerCache(vmDir.diskURL, manifest)
+          if let llc = localLayerCache {
+            let deduplicatedHuman = ByteCountFormatter.string(fromByteCount: Int64(llc.deduplicatedBytes), countStyle: .file)
+
+            if deduplicate {
+              defaultLogger.appendNewLine("found an image \(llc.name) that will allow us to deduplicate \(deduplicatedHuman), using it as a base...")
+            } else {
+              defaultLogger.appendNewLine("found an image \(llc.name) that will allow us to avoid fetching \(deduplicatedHuman), will try use it...")
+            }
           }
 
-          try await tmpVMDir.pullFromRegistry(registry: registry, manifest: manifest, concurrency: concurrency, localLayerCache: localLayerCache)
+          try await tmpVMDir.pullFromRegistry(registry: registry, manifest: manifest, concurrency: concurrency, localLayerCache: localLayerCache, deduplicate: deduplicate)
         } recoverFromFailure: { error in
-          print("Error: \(error.localizedDescription)")
-          print("Attempting to re-try...")
+          if error is URLError {
+            print("Error pulling image: \"\(error.localizedDescription)\", attempting to re-try...")
 
-          return .retry
+            return .retry
+          }
+
+          return .throw
         }
         try move(digestName, from: tmpVMDir)
         transaction.finish()
@@ -231,6 +242,9 @@ class VMStorageOCI: PrunableStorage {
       // are excluded from garbage collection
       VMDirectory(baseURL: vmURL(name)).markExplicitlyPulled()
     }
+
+    // to explicitly set the image as being accessed so it won't get pruned immediately
+    _ = try VMStorageOCI().open(name)
   }
 
   func linked(from: RemoteName, to: RemoteName) -> Bool {
@@ -248,6 +262,59 @@ class VMStorageOCI: PrunableStorage {
     try FileManager.default.createSymbolicLink(at: vmURL(from), withDestinationURL: vmURL(to))
 
     try gc()
+  }
+
+  func chooseLocalLayerCache(_ name: RemoteName, _ manifest: OCIManifest, _ registry: Registry) async throws -> LocalLayerCache? {
+    // Establish a closure that will calculate how much bytes
+    // we'll deduplicate if we re-use the given manifest
+    let target = Swift.Set(manifest.layers)
+
+    let calculateDeduplicatedBytes = { (manifest: OCIManifest) -> UInt64 in
+      target.intersection(manifest.layers).map({ UInt64($0.size) }).reduce(0, +)
+    }
+
+    // Load OCI VM images and their manifests (if present)
+    var candidates: [(name: String, vmDir: VMDirectory, manifest: OCIManifest, deduplicatedBytes: UInt64)] = []
+
+    for (name, vmDir, isSymlink) in try list() {
+      if isSymlink {
+        continue
+      }
+
+      guard let manifestJSON = try? Data(contentsOf: vmDir.manifestURL) else {
+        continue
+      }
+
+      guard let manifest = try? OCIManifest(fromJSON: manifestJSON) else {
+        continue
+      }
+
+      candidates.append((name, vmDir, manifest, calculateDeduplicatedBytes(manifest)))
+    }
+
+    // Previously we haven't stored the OCI VM image manifests, but still fetched the VM image manifest if
+    // what the user was trying to pull was a tagged image, and we already had that image in the OCI VM cache
+    //
+    // Keep supporting this behavior for backwards comaptibility, but only communicate
+    // with the registry if we haven't already retrieved the manifest for that OCI VM image.
+    if name.reference.type == .Tag,
+       let vmDir = try? open(name),
+       let digest = try? digest(name),
+       try !candidates.contains(where: {try $0.manifest.digest() == digest}),
+       let (manifest, _) = try? await registry.pullManifest(reference: digest) {
+      candidates.append((name.description, vmDir, manifest, calculateDeduplicatedBytes(manifest)))
+    }
+
+    // Now, find the best match based on how many bytes we'll deduplicate
+    let choosen = candidates.filter {
+      $0.deduplicatedBytes > 1024 * 1024 * 1024 // save at least 1GB
+    }.max { left, right in
+      return left.deduplicatedBytes < right.deduplicatedBytes
+    }
+
+    return try choosen.flatMap({ choosen in
+      try LocalLayerCache(choosen.name, choosen.deduplicatedBytes, choosen.vmDir.diskURL, choosen.manifest)
+    })
   }
 }
 

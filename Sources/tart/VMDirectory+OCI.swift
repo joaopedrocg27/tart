@@ -11,10 +11,7 @@ enum OCIError: Error {
 }
 
 extension VMDirectory {
-  private static let bufferSizeBytes = 64 * 1024 * 1024
-  private static let layerLimitBytes = 500 * 1000 * 1000
-
-  func pullFromRegistry(registry: Registry, manifest: OCIManifest, concurrency: UInt, localLayerCache: LocalLayerCache?) async throws {
+  func pullFromRegistry(registry: Registry, manifest: OCIManifest, concurrency: UInt, localLayerCache: LocalLayerCache?, deduplicate: Bool) async throws {
     // Pull VM's config file layer and re-serialize it into a config file
     let configLayers = manifest.layers.filter {
       $0.mediaType == configMediaType
@@ -27,7 +24,7 @@ extension VMDirectory {
     }
     let configFile = try FileHandle(forWritingTo: configURL)
     try await registry.pullBlob(configLayers.first!.digest) { data in
-      configFile.write(data)
+      try configFile.write(contentsOf: data)
     }
     try configFile.close()
 
@@ -57,9 +54,15 @@ extension VMDirectory {
     do {
       try await diskImplType.pull(registry: registry, diskLayers: layers, diskURL: diskURL,
                                   concurrency: concurrency, progress: progress,
-                                  localLayerCache: localLayerCache)
+                                  localLayerCache: localLayerCache,
+                                  deduplicate: deduplicate)
     } catch let error where error is FilterError {
       throw RuntimeError.PullFailed("failed to decompress disk: \(error.localizedDescription)")
+    }
+
+    if deduplicate, let llc = localLayerCache {
+      // set custom attribute to remember deduplicated bytes
+      diskURL.setDeduplicatedBytes(llc.deduplicatedBytes)
     }
 
     // Pull VM's NVRAM file layer and store it in an NVRAM file
@@ -76,16 +79,23 @@ extension VMDirectory {
     }
     let nvram = try FileHandle(forWritingTo: nvramURL)
     try await registry.pullBlob(nvramLayers.first!.digest) { data in
-      nvram.write(data)
+      try nvram.write(contentsOf: data)
     }
     try nvram.close()
+
+    // Serialize VM's manifest to enable better deduplication on subsequent "tart pull"'s
+    try manifest.toJSON().write(to: manifestURL)
   }
 
-  func pushToRegistry(registry: Registry, references: [String], chunkSizeMb: Int, diskFormat: String) async throws -> RemoteName {
+  func pushToRegistry(registry: Registry, references: [String], chunkSizeMb: Int, diskFormat: String, concurrency: UInt, labels: [String: String] = [:]) async throws -> RemoteName {
     var layers = Array<OCIManifestLayer>()
 
     // Read VM's config and push it as blob
     let config = try VMConfig(fromURL: configURL)
+
+    // Add disk format label automatically
+    var labels = labels
+    labels[diskFormatLabel] = config.diskFormat.rawValue
     let configJSON = try JSONEncoder().encode(config)
     defaultLogger.appendNewLine("pushing config...")
     let configDigest = try await registry.pushBlob(fromData: configJSON, chunkSizeMb: chunkSizeMb)
@@ -100,9 +110,9 @@ extension VMDirectory {
 
     switch diskFormat {
     case "v1":
-      layers.append(contentsOf: try await DiskV1.push(diskURL: diskURL, registry: registry, chunkSizeMb: chunkSizeMb, progress: progress))
+      layers.append(contentsOf: try await DiskV1.push(diskURL: diskURL, registry: registry, chunkSizeMb: chunkSizeMb, concurrency: concurrency, progress: progress))
     case "v2":
-      layers.append(contentsOf: try await DiskV2.push(diskURL: diskURL, registry: registry, chunkSizeMb: chunkSizeMb, progress: progress))
+      layers.append(contentsOf: try await DiskV2.push(diskURL: diskURL, registry: registry, chunkSizeMb: chunkSizeMb, concurrency: concurrency, progress: progress))
     default:
       throw RuntimeError.OCIUnsupportedDiskFormat(diskFormat)
     }
@@ -115,7 +125,8 @@ extension VMDirectory {
     layers.append(OCIManifestLayer(mediaType: nvramMediaType, size: nvram.count, digest: nvramDigest))
 
     // Craft a stub OCI config for Docker Hub compatibility
-    let ociConfigJSON = try OCIConfig(architecture: config.arch, os: config.os).toJSON()
+    let ociConfigContainer = OCIConfig.ConfigContainer(Labels: labels)
+    let ociConfigJSON = try OCIConfig(architecture: config.arch, os: config.os, config: ociConfigContainer).toJSON()
     let ociConfigDigest = try await registry.pushBlob(fromData: ociConfigJSON, chunkSizeMb: chunkSizeMb)
     let manifest = OCIManifest(
       config: OCIManifestConfig(size: ociConfigJSON.count, digest: ociConfigDigest),

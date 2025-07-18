@@ -1,6 +1,5 @@
 import Foundation
 import Virtualization
-import AsyncAlgorithms
 import Semaphore
 
 struct UnsupportedRestoreImageError: Error {
@@ -47,8 +46,12 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
        directorySharingDevices: [VZDirectorySharingDeviceConfiguration] = [],
        serialPorts: [VZSerialPortConfiguration] = [],
        suspendable: Bool = false,
+       nested: Bool = false,
        audio: Bool = true,
-       clipboard: Bool = true
+       clipboard: Bool = true,
+       sync: VZDiskImageSynchronizationMode = .full,
+       caching: VZDiskImageCachingMode? = nil,
+       noTrackpad: Bool = false
   ) throws {
     name = vmDir.name
     config = try VMConfig.init(fromURL: vmDir.configURL)
@@ -65,8 +68,12 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
                                                 directorySharingDevices: directorySharingDevices,
                                                 serialPorts: serialPorts,
                                                 suspendable: suspendable,
+                                                nested: nested,
                                                 audio: audio,
-                                                clipboard: clipboard
+                                                clipboard: clipboard,
+                                                sync: sync,
+                                                caching: caching,
+                                                noTrackpad: noTrackpad
     )
     virtualMachine = VZVirtualMachine(configuration: configuration)
 
@@ -94,16 +101,13 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     // Download the IPSW
     defaultLogger.appendNewLine("Fetching \(remoteURL.lastPathComponent)...")
 
-    let downloadProgress = Progress(totalUnitCount: 100)
-    ProgressObserver(downloadProgress).log(defaultLogger)
-
     let request = URLRequest(url: remoteURL)
-    let (channel, response) = try await Fetcher.fetch(request, viaFile: true, progress: downloadProgress)
+    let (channel, response) = try await Fetcher.fetch(request, viaFile: true)
 
     let temporaryLocation = try Config().tartTmpDir.appendingPathComponent(UUID().uuidString + ".ipsw")
-    defaultLogger.appendNewLine("Computing digest for \(temporaryLocation.path)...")
-    let digestProgress = Progress(totalUnitCount: response.expectedContentLength)
-    ProgressObserver(digestProgress).log(defaultLogger)
+
+    let progress = Progress(totalUnitCount: response.expectedContentLength)
+    ProgressObserver(progress).log(defaultLogger)
 
     FileManager.default.createFile(atPath: temporaryLocation.path, contents: nil)
     let lock = try FileLock(lockURL: temporaryLocation)
@@ -113,10 +117,9 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     let digest = Digest()
 
     for try await chunk in channel {
-      let chunkAsData = Data(chunk)
-      fileHandle.write(chunkAsData)
-      digest.update(chunkAsData)
-      digestProgress.completedUnitCount += Int64(chunk.count)
+      try fileHandle.write(contentsOf: chunk)
+      digest.update(chunk)
+      progress.completedUnitCount += Int64(chunk.count)
     }
 
     try fileHandle.close()
@@ -140,6 +143,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
       vmDir: VMDirectory,
       ipswURL: URL,
       diskSizeGB: UInt16,
+      diskFormat: DiskImageFormat = .raw,
       network: Network = NetworkShared(),
       additionalStorageDevices: [VZStorageDeviceConfiguration] = [],
       directorySharingDevices: [VZDirectorySharingDeviceConfiguration] = [],
@@ -172,14 +176,15 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
       _ = try VZMacAuxiliaryStorage(creatingStorageAt: vmDir.nvramURL, hardwareModel: requirements.hardwareModel)
 
       // Create disk
-      try vmDir.resizeDisk(diskSizeGB)
+      try vmDir.resizeDisk(diskSizeGB, format: diskFormat)
 
       name = vmDir.name
       // Create config
       config = VMConfig(
         platform: Darwin(ecid: VZMacMachineIdentifier(), hardwareModel: requirements.hardwareModel),
         cpuCountMin: requirements.minimumSupportedCPUCount,
-        memorySizeMin: requirements.minimumSupportedMemorySize
+        memorySizeMin: requirements.minimumSupportedMemorySize,
+        diskFormat: diskFormat
       )
       // allocate at least 4 CPUs because otherwise VMs are frequently freezing
       try config.setCPU(cpuCount: max(4, requirements.minimumSupportedCPUCount))
@@ -221,15 +226,15 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
   #endif
 
   @available(macOS 13, *)
-  static func linux(vmDir: VMDirectory, diskSizeGB: UInt16) async throws -> VM {
+  static func linux(vmDir: VMDirectory, diskSizeGB: UInt16, diskFormat: DiskImageFormat = .raw) async throws -> VM {
     // Create NVRAM
     _ = try VZEFIVariableStore(creatingVariableStoreAt: vmDir.nvramURL)
 
     // Create disk
-    try vmDir.resizeDisk(diskSizeGB)
+    try vmDir.resizeDisk(diskSizeGB, format: diskFormat)
 
     // Create config
-    let config = VMConfig(platform: Linux(), cpuCountMin: 4, memorySizeMin: 4096 * 1024 * 1024)
+    let config = VMConfig(platform: Linux(), cpuCountMin: 4, memorySizeMin: 4096 * 1024 * 1024, diskFormat: diskFormat)
     try config.save(toURL: vmDir.configURL)
 
     return try VM(vmDir: vmDir)
@@ -243,6 +248,19 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     } else {
       try await start(recovery)
     }
+  }
+
+  @MainActor
+  func connect(toPort: UInt32) async throws -> VZVirtioSocketConnection {
+    guard let socketDevice = virtualMachine.socketDevices.first else {
+      throw RuntimeError.VMSocketFailed(toPort, ", VM has no socket devices configured")
+    }
+
+    guard let virtioSocketDevice = socketDevice as? VZVirtioSocketDevice else {
+      throw RuntimeError.VMSocketFailed(toPort, ", expected VM's first socket device to have a type of VZVirtioSocketDevice, got \(type(of: socketDevice)) instead")
+    }
+
+    return try await virtioSocketDevice.connect(toPort: toPort)
   }
 
   func run() async throws {
@@ -293,8 +311,12 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     directorySharingDevices: [VZDirectorySharingDeviceConfiguration],
     serialPorts: [VZSerialPortConfiguration],
     suspendable: Bool = false,
+    nested: Bool = false,
     audio: Bool = true,
-    clipboard: Bool = true
+    clipboard: Bool = true,
+    sync: VZDiskImageSynchronizationMode = .full,
+    caching: VZDiskImageCachingMode? = nil,
+    noTrackpad: Bool = false
   ) throws -> VZVirtualMachineConfiguration {
     let configuration = VZVirtualMachineConfiguration()
 
@@ -306,25 +328,41 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     configuration.memorySize = vmConfig.memorySize
 
     // Platform
-    configuration.platform = try vmConfig.platform.platform(nvramURL: nvramURL)
+    configuration.platform = try vmConfig.platform.platform(nvramURL: nvramURL, needsNestedVirtualization: nested)
 
     // Display
     configuration.graphicsDevices = [vmConfig.platform.graphicsDevice(vmConfig: vmConfig)]
 
     // Audio
+    let soundDeviceConfiguration = VZVirtioSoundDeviceConfiguration()
+
     if audio && !suspendable {
-      let soundDeviceConfiguration = VZVirtioSoundDeviceConfiguration()
       let inputAudioStreamConfiguration = VZVirtioSoundDeviceInputStreamConfiguration()
-      inputAudioStreamConfiguration.source = VZHostAudioInputStreamSource()
       let outputAudioStreamConfiguration = VZVirtioSoundDeviceOutputStreamConfiguration()
+
+      inputAudioStreamConfiguration.source = VZHostAudioInputStreamSource()
       outputAudioStreamConfiguration.sink = VZHostAudioOutputStreamSink()
+
       soundDeviceConfiguration.streams = [inputAudioStreamConfiguration, outputAudioStreamConfiguration]
-      configuration.audioDevices = [soundDeviceConfiguration]
+    } else {
+      // just a null speaker
+      soundDeviceConfiguration.streams = [VZVirtioSoundDeviceOutputStreamConfiguration()]
     }
 
+    configuration.audioDevices = [soundDeviceConfiguration]
+
     // Keyboard and mouse
-    configuration.keyboards = vmConfig.platform.keyboards()
-    configuration.pointingDevices = vmConfig.platform.pointingDevices()
+    if suspendable, let platformSuspendable = vmConfig.platform.self as? PlatformSuspendable {
+      configuration.keyboards = platformSuspendable.keyboardsSuspendable()
+      configuration.pointingDevices = platformSuspendable.pointingDevicesSuspendable()
+    } else {
+      configuration.keyboards = vmConfig.platform.keyboards()
+      if noTrackpad {
+        configuration.pointingDevices = vmConfig.platform.pointingDevicesSimplified()
+      } else {
+        configuration.pointingDevices = vmConfig.platform.pointingDevices()
+      }
+    }
 
     // Networking
     configuration.networkDevices = network.attachments().map {
@@ -335,28 +373,29 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     }
 
     // Clipboard sharing via Spice agent
-    if clipboard && vmConfig.os == .linux {
+    if clipboard {
       let spiceAgentConsoleDevice = VZVirtioConsoleDeviceConfiguration()
       let spiceAgentPort = VZVirtioConsolePortConfiguration()
       spiceAgentPort.name = VZSpiceAgentPortAttachment.spiceAgentPortName
-      spiceAgentPort.attachment = VZSpiceAgentPortAttachment()
+      let spiceAgentPortAttachment = VZSpiceAgentPortAttachment()
+      spiceAgentPortAttachment.sharesClipboard = true
+      spiceAgentPort.attachment = spiceAgentPortAttachment
       spiceAgentConsoleDevice.ports[0] = spiceAgentPort
       configuration.consoleDevices.append(spiceAgentConsoleDevice)
     }
 
     // Storage
-    let attachment: VZDiskImageStorageDeviceAttachment = vmConfig.os == .linux ?
-      // Use "cached" caching mode for virtio drive to prevent fs corruption on linux
-      try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false, cachingMode: .cached, synchronizationMode: .full) :
-      try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false)
+    var attachment = try VZDiskImageStorageDeviceAttachment(
+      url: diskURL,
+      readOnly: false,
+      // When not specified, use "cached" caching mode for Linux VMs to prevent file-system corruption[1]
+      //
+      // [1]: https://github.com/cirruslabs/tart/pull/675
+      cachingMode: caching ?? (vmConfig.os == .linux ? .cached : .automatic),
+      synchronizationMode: sync
+    )
 
-    var device: VZStorageDeviceConfiguration
-    if #available(macOS 14, *), vmConfig.os == .linux {
-      device = VZNVMExpressControllerDeviceConfiguration(attachment: attachment)
-    } else {
-      device = VZVirtioBlockDeviceConfiguration(attachment: attachment)
-    }
-    var devices: [VZStorageDeviceConfiguration] = [device]
+    var devices: [VZStorageDeviceConfiguration] = [VZVirtioBlockDeviceConfiguration(attachment: attachment)]
     devices.append(contentsOf: additionalStorageDevices)
     configuration.storageDevices = devices
 
@@ -375,15 +414,16 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     //
     // A dummy console device useful for implementing
     // host feature checks in the guest agent software.
-    if !suspendable {
-      let consolePort = VZVirtioConsolePortConfiguration()
-      consolePort.name = "tart-version-\(CI.version)"
+    let consolePort = VZVirtioConsolePortConfiguration()
+    consolePort.name = "tart-version-\(CI.version)"
 
-      let consoleDevice = VZVirtioConsoleDeviceConfiguration()
-      consoleDevice.ports[0] = consolePort
+    let consoleDevice = VZVirtioConsoleDeviceConfiguration()
+    consoleDevice.ports[0] = consolePort
 
-      configuration.consoleDevices.append(consoleDevice)
-    }
+    configuration.consoleDevices.append(consoleDevice)
+
+    // Socket device
+    configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
 
     try configuration.validate()
 

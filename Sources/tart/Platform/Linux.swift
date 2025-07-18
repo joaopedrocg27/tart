@@ -14,8 +14,12 @@ struct Linux: Platform {
     return result
   }
 
-  func platform(nvramURL: URL) throws -> VZPlatformConfiguration {
-    VZGenericPlatformConfiguration()
+  func platform(nvramURL: URL, needsNestedVirtualization: Bool) throws -> VZPlatformConfiguration {
+    let config = VZGenericPlatformConfiguration()
+    if #available(macOS 15, *) {
+      config.isNestedVirtualizationEnabled = needsNestedVirtualization
+    }
+    return config
   }
 
   func graphicsDevice(vmConfig: VMConfig) -> VZGraphicsDeviceConfiguration {
@@ -37,5 +41,10 @@ struct Linux: Platform {
 
   func pointingDevices() -> [VZPointingDeviceConfiguration] {
     [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+  }
+
+  func pointingDevicesSimplified() -> [VZPointingDeviceConfiguration] {
+    // Linux doesn't support trackpad, so just return the regular pointing devices
+    return pointingDevices()
   }
 }
